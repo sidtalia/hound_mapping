@@ -45,6 +45,13 @@ ros2 run hound_mapping smoke_rail_mapper --ros-args \
   -p dataset:=/root/colcon_ws/src/hound_mapping/data/rail_sim/race-2
 ```
 
+Multi-cam (front/left/right) offline smoke:
+
+```bash
+bash scripts/smoke_multicam_rail.sh
+# or: generate_rail_dataset.py --multicam --out data/rail_sim/race-2_multicam
+```
+
 Viser compare:
 
 ```bash

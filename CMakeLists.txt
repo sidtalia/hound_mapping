@@ -91,6 +91,7 @@ install(TARGETS hound_mapping_core mapping_node smoke_rail_mapper
 install(PROGRAMS
   scripts/generate_rail_dataset.py
   scripts/viser_rail_compare.py
+  scripts/smoke_multicam_rail.sh
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY sim

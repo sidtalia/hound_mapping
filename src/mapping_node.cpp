@@ -255,33 +255,76 @@ class MappingNode : public rclcpp::Node {
 
     auto sensor_qos = rclcpp::SensorDataQoS();
 
-    if (use_depth_) {
-      depth_sub_ = create_subscription<sensor_msgs::msg::Image>(
-          depth_topic_, sensor_qos,
-          [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-            onDepth(msg);
-          });
-      depth_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-          depth_info_topic_, sensor_qos,
-          [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            depth_info_ = *msg;
-            depth_camera_ = cameraFromInfo(*msg);
-          });
-    }
-    if (use_color_) {
-      color_sub_ = create_subscription<sensor_msgs::msg::Image>(
-          color_topic_, sensor_qos,
-          [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-            onColor(msg);
-          });
-      color_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-          color_info_topic_, sensor_qos,
-          [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            color_info_ = *msg;
-            color_camera_ = cameraFromInfo(*msg);
-          });
+    auto bind_cam = [this, sensor_qos](const std::string& name,
+                                        const std::string& depth_topic,
+                                        const std::string& depth_info,
+                                        const std::string& color_topic,
+                                        const std::string& color_info) {
+      auto slot = std::make_shared<CamSlot>();
+      slot->name = name;
+      if (use_depth_) {
+        slot->depth_info_sub = create_subscription<sensor_msgs::msg::CameraInfo>(
+            depth_info, sensor_qos,
+            [slot](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
+              slot->depth_info = *msg;
+              slot->depth_camera = cameraFromInfo(*msg);
+            });
+        slot->depth_sub = create_subscription<sensor_msgs::msg::Image>(
+            depth_topic, sensor_qos,
+            [this, slot](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+              onDepthSlot(slot, msg);
+            });
+      }
+      if (use_color_) {
+        slot->color_info_sub = create_subscription<sensor_msgs::msg::CameraInfo>(
+            color_info, sensor_qos,
+            [slot](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
+              slot->color_info = *msg;
+              slot->color_camera = cameraFromInfo(*msg);
+            });
+        slot->color_sub = create_subscription<sensor_msgs::msg::Image>(
+            color_topic, sensor_qos,
+            [this, slot](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+              onColorSlot(slot, msg);
+            });
+      }
+      cam_slots_.push_back(slot);
+      RCLCPP_INFO(
+          get_logger(), "camera[%s] depth=%s color=%s", name.c_str(),
+          depth_topic.c_str(), color_topic.c_str());
+    };
+
+    if (!camera_names_.empty()) {
+      for (const auto& name : camera_names_) {
+        const std::string depth_topic = "/" + name + "/depth/image_rect_raw";
+        const std::string depth_info = "/" + name + "/depth/camera_info";
+        std::string color_topic = color_topic_template_;
+        if (color_topic.empty()) {
+          color_topic = "/" + name + "/color/image_raw";
+        } else {
+          const std::string token = "{name}";
+          auto pos = color_topic.find(token);
+          if (pos != std::string::npos) {
+            color_topic.replace(pos, token.size(), name);
+          }
+        }
+        std::string color_info = color_info_topic_template_;
+        if (color_info.empty()) {
+          color_info = "/" + name + "/color/camera_info";
+        } else {
+          const std::string token = "{name}";
+          auto pos = color_info.find(token);
+          if (pos != std::string::npos) {
+            color_info.replace(pos, token.size(), name);
+          }
+        }
+        bind_cam(name, depth_topic, depth_info, color_topic, color_info);
+      }
+    } else {
+      // Legacy single-camera topics.
+      bind_cam(
+          "camera", depth_topic_, depth_info_topic_, color_topic_,
+          color_info_topic_);
     }
     if (use_lidar_) {
       lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -330,6 +373,18 @@ class MappingNode : public rclcpp::Node {
   }
 
  private:
+  struct CamSlot {
+    std::string name;
+    std::optional<nvblox::Camera> depth_camera;
+    std::optional<nvblox::Camera> color_camera;
+    sensor_msgs::msg::CameraInfo depth_info;
+    sensor_msgs::msg::CameraInfo color_info;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_sub;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_sub;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr color_info_sub;
+  };
+
   void declareParams()
   {
     declare_parameter("global_frame", "odom");
@@ -360,6 +415,12 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("color_info_topic", "/camera/color/camera_info");
     declare_parameter("lidar_topic", "/unilidar/cloud");
     declare_parameter("people_mask_topic", "/segmentation/coarse_people_mask");
+    // Multi-cam: non-empty list replaces single depth/color topics.
+    // Topics: /{name}/depth/image_rect_raw, /{name}/depth/camera_info,
+    // color from color_topic_template (default /{name}/color/image_raw).
+    declare_parameter("camera_names", std::vector<std::string>{});
+    declare_parameter("color_topic_template", "");  // e.g. /segmentation/{name}/coarse_traversability
+    declare_parameter("color_info_topic_template", "");  // default /{name}/color/camera_info
 
     declare_parameter("lidar_width", 360);
     declare_parameter("lidar_height", 90);
@@ -416,6 +477,10 @@ class MappingNode : public rclcpp::Node {
     color_info_topic_ = get_parameter("color_info_topic").as_string();
     lidar_topic_ = get_parameter("lidar_topic").as_string();
     people_mask_topic_ = get_parameter("people_mask_topic").as_string();
+    camera_names_ = get_parameter("camera_names").as_string_array();
+    color_topic_template_ = get_parameter("color_topic_template").as_string();
+    color_info_topic_template_ =
+        get_parameter("color_info_topic_template").as_string();
 
     lidar_width_ = get_parameter("lidar_width").as_int();
     lidar_height_ = get_parameter("lidar_height").as_int();
@@ -456,6 +521,14 @@ class MappingNode : public rclcpp::Node {
 
   void onDepth(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
   {
+    // Unused — multi/single both go through CamSlot.
+    (void)msg;
+  }
+
+  void onDepthSlot(
+      const std::shared_ptr<CamSlot>& slot,
+      const sensor_msgs::msg::Image::ConstSharedPtr& msg)
+  {
     nvblox::Camera camera;
     sensor_msgs::msg::Image::ConstSharedPtr mask_msg;
     {
@@ -465,10 +538,10 @@ class MappingNode : public rclcpp::Node {
               msg->header.stamp)) {
         return;
       }
-      if (!depth_camera_.has_value()) {
+      if (!slot->depth_camera.has_value()) {
         return;
       }
-      camera = *depth_camera_;
+      camera = *slot->depth_camera;
       if (use_people_mask_) {
         mask_msg = latest_mask_;
       }
@@ -504,6 +577,13 @@ class MappingNode : public rclcpp::Node {
 
   void onColor(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
   {
+    (void)msg;
+  }
+
+  void onColorSlot(
+      const std::shared_ptr<CamSlot>& slot,
+      const sensor_msgs::msg::Image::ConstSharedPtr& msg)
+  {
     nvblox::Camera camera;
     {
       std::lock_guard<std::mutex> lock(map_mutex_);
@@ -512,10 +592,14 @@ class MappingNode : public rclcpp::Node {
               msg->header.stamp)) {
         return;
       }
-      if (!color_camera_.has_value()) {
+      // Prefer color CameraInfo; fall back to depth intrinsics (trav masks).
+      if (slot->color_camera.has_value()) {
+        camera = *slot->color_camera;
+      } else if (slot->depth_camera.has_value()) {
+        camera = *slot->depth_camera;
+      } else {
         return;
       }
-      camera = *color_camera_;
     }
 
     nvblox::Transform T_L_C;
@@ -702,6 +786,9 @@ class MappingNode : public rclcpp::Node {
   std::string color_info_topic_;
   std::string lidar_topic_;
   std::string people_mask_topic_;
+  std::vector<std::string> camera_names_;
+  std::string color_topic_template_;
+  std::string color_info_topic_template_;
   int lidar_width_{360};
   int lidar_height_{90};
   float lidar_vertical_fov_rad_{2.094395f};
@@ -724,10 +811,8 @@ class MappingNode : public rclcpp::Node {
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr color_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr color_info_sub_;
+  std::vector<std::shared_ptr<CamSlot>> cam_slots_;
+
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;
   rclcpp::Publisher<hound_mapping::msg::LocalMap>::SharedPtr local_map_pub_;
@@ -737,12 +822,7 @@ class MappingNode : public rclcpp::Node {
   rclcpp::TimerBase::SharedPtr map_timer_;
 
   std::mutex map_mutex_;
-  std::optional<nvblox::Camera> depth_camera_;
-  std::optional<nvblox::Camera> color_camera_;
-  sensor_msgs::msg::CameraInfo depth_info_;
-  sensor_msgs::msg::CameraInfo color_info_;
   sensor_msgs::msg::Image::ConstSharedPtr latest_mask_;
-
   rclcpp::Time last_depth_integrate_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_color_integrate_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_lidar_integrate_{0, 0, RCL_ROS_TIME};

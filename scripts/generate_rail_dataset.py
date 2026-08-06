@@ -22,13 +22,15 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from sim.dataset_io import save_frame, write_camera_txt, write_meta
+from sim.dataset_io import append_body_pose, save_frame, write_camera_txt, write_meta
 from sim.heightfield_camera import (
+    DEFAULT_VIEW_YAW_OFFSETS,
     CameraModel,
     densify_path,
     densify_path_timed,
     render_depth_trav,
     slope_cost_from_elev,
+    synthetic_stereo_ir,
 )
 
 
@@ -79,6 +81,18 @@ def main() -> None:
     ap.add_argument("--ray-steps", type=int, default=48)
     ap.add_argument("--window-radius", type=float, default=10.0)
     ap.add_argument("--voxel-size", type=float, default=0.05)
+    ap.add_argument(
+        "--multicam",
+        action="store_true",
+        help="Render front/left/right RGBD (+ front stereo IR). "
+        "Views: NNNNNN_{view}_depth_mm.png etc.",
+    )
+    ap.add_argument(
+        "--views",
+        type=str,
+        default="front,left,right",
+        help="Comma-separated view names when --multicam (default front,left,right)",
+    )
     args = ap.parse_args()
 
     elev = np.load(args.elev).astype(np.float32)
@@ -132,12 +146,25 @@ def main() -> None:
     poses_bin = frames / "poses_T_wo.bin"
     if poses_bin.exists():
         poses_bin.unlink()
+    body_bin = frames / "poses_body.bin"
+    if body_bin.exists():
+        body_bin.unlink()
+
+    views = [v.strip() for v in args.views.split(",") if v.strip()]
+    if not args.multicam:
+        views = ["front"]
+    yaw_offsets = {
+        v: float(DEFAULT_VIEW_YAW_OFFSETS.get(v, 0.0)) for v in views
+    }
 
     write_meta(
         out,
         {
             "map_res": args.map_res,
             "elev_shape": list(elev.shape),
+            "multicam": bool(args.multicam),
+            "views": views,
+            "yaw_offsets_deg": {v: float(np.rad2deg(yaw_offsets[v])) for v in views},
             "camera": {
                 "width": cam.width,
                 "height": cam.height,
@@ -174,30 +201,56 @@ def main() -> None:
             "voxel_size": args.voxel_size,
             "elev_h": elev.shape[0],
             "elev_w": elev.shape[1],
+            "n_views": len(views),
+            "views": ",".join(views),
         },
     )
 
     t0 = time.perf_counter()
     for i, pose in enumerate(rail):
-        depth, trav, T = render_depth_trav(
-            elev,
-            cost,
-            args.map_res,
-            float(pose[0]),
-            float(pose[1]),
-            float(pose[2]),
-            cam,
-            n_steps=args.ray_steps,
-        )
-        save_frame(frames, i, depth, trav, T)
+        body_T = None
+        for view in views:
+            depth, trav, T = render_depth_trav(
+                elev,
+                cost,
+                args.map_res,
+                float(pose[0]),
+                float(pose[1]),
+                float(pose[2]),
+                cam,
+                n_steps=args.ray_steps,
+                yaw_offset=yaw_offsets[view],
+            )
+            ir_l = ir_r = None
+            if view == "front":
+                ir_l, ir_r = synthetic_stereo_ir(trav, depth)
+                body_T = T
+            if args.multicam:
+                save_frame(
+                    frames,
+                    i,
+                    depth,
+                    trav,
+                    T,
+                    view=view,
+                    ir_left=ir_l,
+                    ir_right=ir_r,
+                    append_pose_bin=False,
+                )
+            else:
+                save_frame(frames, i, depth, trav, T)
+        if args.multicam and body_T is not None:
+            append_body_pose(frames, body_T)
         if (i + 1) % 10 == 0 or i == 0:
-            valid = float(np.count_nonzero(depth > 0)) / depth.size
             print(
-                f"[{i+1}/{len(rail)}] depth valid={100*valid:.1f}% "
+                f"[{i+1}/{len(rail)}] views={views} "
                 f"pose=({pose[0]:.1f},{pose[1]:.1f},{pose[2]:.2f})"
             )
     dt = time.perf_counter() - t0
-    print(f"Wrote {len(rail)} frames → {out} in {dt:.1f}s ({dt/len(rail)*1e3:.0f} ms/frame)")
+    print(
+        f"Wrote {len(rail)} frames × {len(views)} views → {out} "
+        f"in {dt:.1f}s ({dt/max(len(rail),1)*1e3:.0f} ms/pose)"
+    )
 
 
 if __name__ == "__main__":
