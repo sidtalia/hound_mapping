@@ -31,13 +31,25 @@ class MapperCore {
 
   void integrateLidar(
       const nvblox::Pointcloud& cloud, const nvblox::Transform& T_L_S,
-      const nvblox::Lidar& lidar, bool motion_compensation = false);
+      const nvblox::Lidar& lidar, bool motion_compensation = false,
+      const std::optional<nvblox::Transform>& T_L_S_scan_end = std::nullopt,
+      const std::optional<nvblox::Time>& scan_duration_ms = std::nullopt);
 
   void integrateColor(
       const nvblox::ColorImage& color, const nvblox::Transform& T_L_C,
       const nvblox::Camera& camera);
 
   void clearOutsideRadius(const nvblox::Vector3f& center_L);
+
+  /// Serialize TSDF/color LayerCake to an nvblox SQLite map file.
+  /// Must be called from the thread that owns the mapper (no concurrent integrate).
+  bool saveLayerCake(const std::string& path) const;
+
+  /// Replace layers from a LayerCake file (clears existing map).
+  bool loadLayerCake(const std::string& path);
+
+  /// Full color mesh from TSDF(+color) → PLY. Call after load or integrate.
+  bool exportColorMeshPly(const std::string& ply_path);
 
   nvblox::Mapper& mapper() { return *mapper_; }
   const nvblox::Mapper& mapper() const { return *mapper_; }

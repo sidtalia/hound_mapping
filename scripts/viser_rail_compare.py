@@ -228,12 +228,27 @@ def load_poses(frames_dir: Path, n: int) -> np.ndarray:
         arr = np.fromfile(bin_path, dtype=np.float64)
         if arr.size >= n * 16:
             return arr[: n * 16].reshape(n, 4, 4)
+    body_bin = frames_dir / "poses_body.bin"
+    if body_bin.exists():
+        arr = np.fromfile(body_bin, dtype=np.float64)
+        if arr.size >= n * 16:
+            return arr[: n * 16].reshape(n, 4, 4)
     poses = []
     for i in range(n):
-        p = frames_dir / f"{i:06d}_T_wo.npy"
-        if not p.exists():
+        stem = f"{i:06d}"
+        for cand in (
+            frames_dir / f"{stem}_T_wo.npy",
+            frames_dir / f"{stem}_front_T_wo.bin",
+            frames_dir / f"{stem}_T_wo.bin",
+        ):
+            if cand.suffix == ".npy" and cand.exists():
+                poses.append(np.load(cand))
+                break
+            if cand.suffix == ".bin" and cand.exists():
+                poses.append(np.fromfile(cand, dtype=np.float64).reshape(4, 4))
+                break
+        else:
             break
-        poses.append(np.load(p))
     return np.asarray(poses, dtype=np.float64)
 
 
@@ -381,7 +396,11 @@ def main() -> None:
 
         stem = f"{i:06d}"
         depth_p = frames_dir / f"{stem}_depth.npy"
+        if not depth_p.exists():
+            depth_p = frames_dir / f"{stem}_front_depth.npy"
         trav_p = frames_dir / f"{stem}_trav.png"
+        if not trav_p.exists():
+            trav_p = frames_dir / f"{stem}_front_trav.png"
         if depth_p.exists():
             depth = np.load(depth_p)
             rgb = depth_to_rgb(depth, max_depth)

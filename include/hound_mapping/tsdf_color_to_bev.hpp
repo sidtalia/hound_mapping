@@ -5,6 +5,8 @@
 #include <nvblox/core/cuda_stream.h>
 #include <nvblox/map/common_names.h>
 
+#include "hound_mapping/prior_bev_gpu.hpp"
+
 namespace hound_mapping {
 
 struct TsdfColorToBevParams {
@@ -57,13 +59,13 @@ class TsdfColorToBevWorkspace {
 };
 
 /// Block-scatter TSDF → BEV: free/occ Z-bits → overhang floor → semantic cost.
-/// Does not compute normals/slope (call apply_slope_normals_cost after optional
-/// elev inpaint).
+/// Optional prior: when TSDF has no surface, sample PriorBevGpu (loop1 fill).
 void tsdf_color_to_bev(
     const nvblox::TsdfLayer& tsdf, const nvblox::ColorLayer& color,
     const TsdfColorToBevParams& params, TsdfColorToBevWorkspace* workspace,
     float* elev_host, float* lum_host, float* cost_host,
-    uint8_t* observed_host, const nvblox::CudaStream& cuda_stream);
+    uint8_t* observed_host, const nvblox::CudaStream& cuda_stream,
+    const PriorBevGpu* prior = nullptr);
 
 /// GPU normals from elev + slope OR into cost. Unobserved cells get cost =
 /// slope_lethal only (semantic lethality cleared after elev inpaint).

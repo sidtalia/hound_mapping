@@ -39,10 +39,13 @@ void MapperCore::integrateDepth(
 
 void MapperCore::integrateLidar(
     const nvblox::Pointcloud& cloud, const nvblox::Transform& T_L_S,
-    const nvblox::Lidar& lidar, bool motion_compensation)
+    const nvblox::Lidar& lidar, bool motion_compensation,
+    const std::optional<nvblox::Transform>& T_L_S_scan_end,
+    const std::optional<nvblox::Time>& scan_duration_ms)
 {
   mapper_->integrateDepth(
-      cloud, T_L_S, lidar, motion_compensation, std::nullopt, std::nullopt);
+      cloud, T_L_S, lidar, motion_compensation, T_L_S_scan_end,
+      scan_duration_ms);
 }
 
 void MapperCore::integrateColor(
@@ -57,6 +60,23 @@ void MapperCore::clearOutsideRadius(const nvblox::Vector3f& center_L)
   if (config_.map_clearing_radius_m > 0.f) {
     mapper_->clearOutsideRadius(center_L, config_.map_clearing_radius_m);
   }
+}
+
+bool MapperCore::saveLayerCake(const std::string& path) const
+{
+  return mapper_->saveLayerCake(path);
+}
+
+bool MapperCore::loadLayerCake(const std::string& path)
+{
+  nvblox::BlockMemoryPoolParams pool_params(nvblox::MemoryType::kDevice);
+  return mapper_->loadMap(path, pool_params);
+}
+
+bool MapperCore::exportColorMeshPly(const std::string& ply_path)
+{
+  mapper_->updateColorMesh(nvblox::UpdateFullLayer::kYes);
+  return mapper_->saveColorMeshAsPly(ply_path);
 }
 
 }  // namespace hound_mapping

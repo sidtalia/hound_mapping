@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 #include <opencv2/core.hpp>
 
@@ -8,6 +9,7 @@
 #include <nvblox/nvblox.h>
 
 #include "hound_mapping/mapper_core.hpp"
+#include "hound_mapping/prior_bev_gpu.hpp"
 #include "hound_mapping/tsdf_color_to_bev.hpp"
 
 namespace hound_mapping {
@@ -51,10 +53,40 @@ struct ExtractTiming {
   double total_ms = 0.0;
 };
 
+/// Axis-aligned bounds of allocated TSDF blocks in layer frame (meters).
+struct TsdfAabb {
+  float min_x{0}, min_y{0}, min_z{0};
+  float max_x{0}, max_y{0}, max_z{0};
+  bool valid{false};
+};
+
+TsdfAabb aabbFromTsdfLayer(const nvblox::TsdfLayer& tsdf, float pad_m = 0.f);
+
 class ElevationCostExtractor {
  public:
   explicit ElevationCostExtractor(const ElevationCostConfig& config);
 
+  /// Optional GPU prior sampled in Finalize when live TSDF has no surface.
+  void setPrior(const PriorBevGpu* prior) { prior_ = prior; }
+  const PriorBevGpu* prior() const { return prior_; }
+
+  /// Loop1: TSDF/color → elev/cost/obs/lum (owned clones). No inpaint/normals.
+  LocalMaps extractBev(
+      const nvblox::TsdfLayer& tsdf, const nvblox::ColorLayer& color,
+      const nvblox::Vector3f& center_L, float clearing_z_L,
+      ExtractTiming* timing = nullptr);
+
+  /// Explicit grid + absolute Z band (full-coverage prior extract).
+  LocalMaps extractBevGrid(
+      const nvblox::TsdfLayer& tsdf, const nvblox::ColorLayer& color,
+      float origin_x, float origin_y, int width, int height, float z_min,
+      float z_max, float unknown_elev_z, ExtractTiming* timing = nullptr,
+      bool use_prior = true);
+
+  /// Loop2: inpaint elev → slope/normals → elev_color. Mutates maps in place.
+  void finishLocalMap(LocalMaps* maps, ExtractTiming* timing = nullptr);
+
+  /// Full pipeline (BEV + finish). Used by offline smoke tools.
   LocalMaps extract(
       const nvblox::TsdfLayer& tsdf, const nvblox::ColorLayer& color,
       const nvblox::Vector3f& center_L, float clearing_z_L,
@@ -66,19 +98,18 @@ class ElevationCostExtractor {
 
  private:
   void ensureHost(int width, int height);
-  void colorizeFromLuminance();
-  void lowResTeleaInpaintElev();
+  void colorizeFromLuminance(const cv::Mat& luminance, cv::Mat* elev_color);
+  void lowResTeleaInpaintElev(cv::Mat* elevation, const cv::Mat& observed);
 
   ElevationCostConfig config_;
   std::shared_ptr<nvblox::CudaStream> cuda_stream_;
   TsdfColorToBevWorkspace bev_ws_;
+  const PriorBevGpu* prior_{nullptr};
 
   cv::Mat elevation_;
   cv::Mat observed_;
   cv::Mat cost_;
-  cv::Mat normals_;
   cv::Mat luminance_;
-  cv::Mat elev_color_;
   int host_w_ = 0;
   int host_h_ = 0;
 };

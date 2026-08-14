@@ -122,7 +122,10 @@ __global__ void finalize_from_bits_kernel(
     float robot_height_m, float tsdf_weight_min, float unobserved_luminance,
     float color_weight_min, int n_words, const uint32_t* occ_bits,
     const uint32_t* free_bits, float* elev, float* lum, float* cost,
-    uint8_t* observed) {
+    uint8_t* observed, const float* prior_elev, const float* prior_cost,
+    const uint8_t* prior_obs, float prior_ox, float prior_oy, float prior_res,
+    int prior_w, int prior_h, float prior_tx, float prior_ty, float prior_tz,
+    float prior_yaw, bool prior_enabled) {
   const int ix = blockIdx.x * blockDim.x + threadIdx.x;
   const int iy = blockIdx.y * blockDim.y + threadIdx.y;
   if (ix >= width || iy >= height) {
@@ -177,7 +180,13 @@ __global__ void finalize_from_bits_kernel(
   }
 
   float L = unobserved_luminance;
+  float out_elev = unknown_elev_z;
+  float out_cost = 1.f;
+  uint8_t out_obs = 0;
+
   if (found) {
+    out_elev = surface_z;
+    out_obs = 255;
     const float x = origin_x + (static_cast<float>(ix) + 0.5f) * resolution;
     const float y = origin_y + (static_cast<float>(iy) + 0.5f) * resolution;
     nvblox::ColorVoxel* cv = nullptr;
@@ -189,15 +198,41 @@ __global__ void finalize_from_bits_kernel(
           0.587f * static_cast<float>(c.g()) +
           0.114f * static_cast<float>(c.b());
     }
+    out_cost = clampf(1.f - L / 255.f, 0.f, 1.f);
+  } else if (
+      prior_enabled && prior_elev && prior_cost && prior_obs && prior_w > 0 &&
+      prior_h > 0 && prior_res > 0.f) {
+    // Live cell center in global → prior frame: R(-yaw)*(p - t).
+    const float x = origin_x + (static_cast<float>(ix) + 0.5f) * resolution;
+    const float y = origin_y + (static_cast<float>(iy) + 0.5f) * resolution;
+    const float dx = x - prior_tx;
+    const float dy = y - prior_ty;
+    const float c = cosf(-prior_yaw);
+    const float s = sinf(-prior_yaw);
+    const float xp = c * dx - s * dy;
+    const float yp = s * dx + c * dy;
+    const int pix =
+        static_cast<int>(floorf((xp - prior_ox) / prior_res));
+    const int piy =
+        static_cast<int>(floorf((yp - prior_oy) / prior_res));
+    if (pix >= 0 && piy >= 0 && pix < prior_w && piy < prior_h) {
+      const int pcell = piy * prior_w + pix;
+      if (prior_obs[pcell] != 0) {
+        out_elev = prior_elev[pcell] + prior_tz;
+        out_cost = clampf(prior_cost[pcell], 0.f, 1.f);
+        L = clampf((1.f - out_cost) * 255.f, 0.f, 255.f);
+        out_obs = 255;
+      }
+    }
   }
 
-  elev[cell] = found ? surface_z : unknown_elev_z;
+  elev[cell] = out_elev;
   lum[cell] = L;
   if (cost) {
-    cost[cell] = found ? clampf(1.f - L / 255.f, 0.f, 1.f) : 1.f;
+    cost[cell] = out_cost;
   }
   if (observed) {
-    observed[cell] = found ? 255 : 0;
+    observed[cell] = out_obs;
   }
 }
 
@@ -378,7 +413,8 @@ void tsdf_color_to_bev(
     const nvblox::TsdfLayer& tsdf, const nvblox::ColorLayer& color,
     const TsdfColorToBevParams& params, TsdfColorToBevWorkspace* workspace,
     float* elev_host, float* lum_host, float* cost_host,
-    uint8_t* observed_host, const nvblox::CudaStream& cuda_stream) {
+    uint8_t* observed_host, const nvblox::CudaStream& cuda_stream,
+    const PriorBevGpu* prior) {
   if (params.width <= 0 || params.height <= 0 || elev_host == nullptr ||
       lum_host == nullptr || workspace == nullptr) {
     return;
@@ -436,6 +472,9 @@ void tsdf_color_to_bev(
     checkCuda(cudaGetLastError(), "scatter_block_voxels_kernel");
   }
 
+  const bool prior_ok =
+      prior && prior->enabled && prior->elev_d && prior->cost_d &&
+      prior->obs_d && prior->width > 0 && prior->height > 0;
   dim3 t2(16, 16);
   dim3 b2(
       (params.width + t2.x - 1) / t2.x, (params.height + t2.y - 1) / t2.y);
@@ -445,7 +484,20 @@ void tsdf_color_to_bev(
       params.unknown_elev_z, params.robot_height_m, params.tsdf_weight_min,
       params.unobserved_luminance, params.color_weight_min, n_words,
       workspace->occ_bits_d, workspace->free_bits_d, workspace->elev_d,
-      workspace->lum_d, workspace->cost_d, workspace->obs_d);
+      workspace->lum_d, workspace->cost_d, workspace->obs_d,
+      prior_ok ? prior->elev_d : nullptr,
+      prior_ok ? prior->cost_d : nullptr,
+      prior_ok ? prior->obs_d : nullptr,
+      prior_ok ? prior->origin_x : 0.f,
+      prior_ok ? prior->origin_y : 0.f,
+      prior_ok ? prior->resolution : 0.f,
+      prior_ok ? prior->width : 0,
+      prior_ok ? prior->height : 0,
+      prior_ok ? prior->tx : 0.f,
+      prior_ok ? prior->ty : 0.f,
+      prior_ok ? prior->tz : 0.f,
+      prior_ok ? prior->yaw : 0.f,
+      prior_ok);
   checkCuda(cudaGetLastError(), "finalize_from_bits_kernel");
 
   const size_t nbytes_f = static_cast<size_t>(n) * sizeof(float);

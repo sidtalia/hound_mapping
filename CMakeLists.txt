@@ -14,6 +14,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
@@ -31,6 +32,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 add_library(hound_mapping_core
   src/mapper_core.cpp
   src/elevation_cost.cpp
+  src/prior_bev_gpu.cpp
   cuda/tsdf_color_to_bev.cu
 )
 target_include_directories(hound_mapping_core PUBLIC
@@ -61,6 +63,7 @@ ament_target_dependencies(mapping_node
   geometry_msgs
   nav_msgs
   std_msgs
+  std_srvs
   tf2
   tf2_ros
   tf2_eigen
@@ -83,7 +86,19 @@ target_link_libraries(smoke_rail_mapper
 )
 target_compile_features(smoke_rail_mapper PUBLIC cxx_std_17)
 
-install(TARGETS hound_mapping_core mapping_node smoke_rail_mapper
+add_executable(layercake_to_mesh_node src/layercake_to_mesh_node.cpp)
+ament_target_dependencies(layercake_to_mesh_node
+  rclcpp
+  std_srvs
+)
+target_link_libraries(layercake_to_mesh_node
+  hound_mapping_core
+  nvblox::nvblox_lib
+)
+target_compile_features(layercake_to_mesh_node PUBLIC cxx_std_17)
+
+install(TARGETS
+  hound_mapping_core mapping_node smoke_rail_mapper layercake_to_mesh_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
