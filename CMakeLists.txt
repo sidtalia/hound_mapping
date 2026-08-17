@@ -13,6 +13,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -62,6 +63,7 @@ ament_target_dependencies(mapping_node
   sensor_msgs
   geometry_msgs
   nav_msgs
+  visualization_msgs
   std_msgs
   std_srvs
   tf2
@@ -117,7 +119,7 @@ install(DIRECTORY include/
 )
 
 ament_export_dependencies(
-  rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs
+  rclcpp sensor_msgs geometry_msgs nav_msgs visualization_msgs std_msgs
   tf2 tf2_ros tf2_eigen nvblox
 )
 ament_export_include_directories(include)

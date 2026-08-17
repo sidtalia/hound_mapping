@@ -4,8 +4,8 @@
   <name>hound_mapping</name>
   <version>0.1.0</version>
   <description>
-    ROS-thin nvblox mapping: TSDF integrate + GPU TSDF→BEV elev/cost/normals,
-    LocalMap publish (no GridMap). Core is ROS-free for a future Dora exit.
+    ROS-thin nvblox mapping: TSDF integrate + GPU TSDF→BEV elev/cost,
+    LocalMap publish. Core is ROS-free for a future Dora exit.
   </description>
   <maintainer email="hound@todo.todo">hound</maintainer>
   <license>Apache-2.0</license>
@@ -17,6 +17,7 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2</depend>

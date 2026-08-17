@@ -75,14 +75,18 @@ void ElevationCostExtractor::ensureHost(int width, int height)
   host_h_ = height;
 }
 
-void ElevationCostExtractor::lowResTeleaInpaintElev(
-    cv::Mat* elevation, const cv::Mat& observed)
+void ElevationCostExtractor::lowResTeleaInpaintField(
+    cv::Mat* field, const cv::Mat& hole_mask)
 {
-  const int w = elevation->cols;
-  const int h = elevation->rows;
-  if (cv::countNonZero(observed) == w * h) {
+  if (!field || field->empty() || hole_mask.empty() ||
+      field->size() != hole_mask.size() || field->type() != CV_32FC1) {
     return;
   }
+  if (cv::countNonZero(hole_mask) == 0) {
+    return;
+  }
+  const int w = field->cols;
+  const int h = field->rows;
   const float src_res = config_.resolution_m > 0.f
       ? config_.resolution_m
       : 0.05f;
@@ -91,41 +95,50 @@ void ElevationCostExtractor::lowResTeleaInpaintElev(
   const int dw = std::max(1, static_cast<int>(std::lround(w * scale)));
   const int dh = std::max(1, static_cast<int>(std::lround(h * scale)));
 
-  cv::Mat elev_lr;
-  cv::Mat obs_lr;
-  cv::resize(*elevation, elev_lr, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
-  cv::resize(observed, obs_lr, cv::Size(dw, dh), 0, 0, cv::INTER_NEAREST);
-
+  cv::Mat field_lr;
   cv::Mat mask_lr;
-  cv::compare(obs_lr, 0, mask_lr, cv::CMP_EQ);
+  cv::resize(*field, field_lr, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
+  cv::resize(hole_mask, mask_lr, cv::Size(dw, dh), 0, 0, cv::INTER_NEAREST);
   if (cv::countNonZero(mask_lr) == 0) {
     return;
   }
 
-  double zmin = 0.0;
-  double zmax = 1.0;
-  cv::minMaxLoc(elev_lr, &zmin, &zmax, nullptr, nullptr, obs_lr);
-  if (!(zmax > zmin)) {
-    zmin = 0.0;
-    zmax = 1.0;
+  cv::Mat known_lr;
+  cv::bitwise_not(mask_lr, known_lr);
+  double vmin = 0.0;
+  double vmax = 1.0;
+  cv::minMaxLoc(field_lr, &vmin, &vmax, nullptr, nullptr, known_lr);
+  if (!(vmax > vmin)) {
+    vmin = 0.0;
+    vmax = 1.0;
   }
-  const float z_scale = 255.f / static_cast<float>(zmax - zmin);
-  cv::Mat elev8;
-  elev_lr.convertTo(
-      elev8, CV_8UC1, z_scale, -static_cast<float>(zmin) * z_scale);
-  elev8.setTo(0, mask_lr);
+  const float v_scale = 255.f / static_cast<float>(vmax - vmin);
+  cv::Mat field8;
+  field_lr.convertTo(
+      field8, CV_8UC1, v_scale, -static_cast<float>(vmin) * v_scale);
+  field8.setTo(0, mask_lr);
 
   cv::Mat filled8;
   cv::inpaint(
-      elev8, mask_lr, filled8, std::max(1, config_.inpaint_radius),
+      field8, mask_lr, filled8, std::max(1, config_.inpaint_radius),
       cv::INPAINT_TELEA);
   cv::Mat filled_lr;
-  filled8.convertTo(filled_lr, CV_32FC1, 1.0 / z_scale, zmin);
+  filled8.convertTo(filled_lr, CV_32FC1, 1.0 / v_scale, vmin);
 
   cv::Mat filled_hr;
-  cv::resize(
-      filled_lr, filled_hr, elevation->size(), 0, 0, cv::INTER_LINEAR);
-  filled_hr.copyTo(*elevation, observed == 0);
+  cv::resize(filled_lr, filled_hr, field->size(), 0, 0, cv::INTER_LINEAR);
+  filled_hr.copyTo(*field, hole_mask);
+}
+
+void ElevationCostExtractor::lowResTeleaInpaintElev(
+    cv::Mat* elevation, const cv::Mat& observed)
+{
+  if (!elevation || elevation->empty() || observed.empty()) {
+    return;
+  }
+  cv::Mat hole;
+  cv::compare(observed, 0, hole, cv::CMP_EQ);
+  lowResTeleaInpaintField(elevation, hole);
 }
 
 LocalMaps ElevationCostExtractor::extractBevGrid(
@@ -154,8 +167,10 @@ LocalMaps ElevationCostExtractor::extractBevGrid(
   p.unknown_elev_z = unknown_elev_z;
   p.robot_height_m = config_.robot_height_m;
   p.tsdf_weight_min = config_.tsdf_weight_min;
+  p.bev_occ_tsdf_max_m = config_.bev_occ_tsdf_max_m;
   p.unobserved_luminance = config_.unobserved_luminance;
   p.color_weight_min = config_.color_weight_min;
+  p.color_z_search_half_band_m = config_.color_z_search_half_band_m;
   p.lethal_slope_deg = config_.lethal_slope_deg;
 
   const PriorBevGpu* prior_arg =
@@ -223,7 +238,17 @@ void ElevationCostExtractor::finishLocalMap(
   double inpaint_ms = 0.0;
   if (config_.do_inpaint) {
     const auto t0 = Clock::now();
-    lowResTeleaInpaintElev(&maps->elevation, maps->observed);
+    cv::Mat hole;
+    cv::compare(maps->observed, 0, hole, cv::CMP_EQ);
+    lowResTeleaInpaintField(&maps->elevation, hole);
+    // Same holes as elev: pull cost/lum from neighbors (no leftover grey).
+    if (!maps->cost.empty() && maps->cost.size() == maps->elevation.size()) {
+      lowResTeleaInpaintField(&maps->cost, hole);
+    }
+    if (!maps->luminance.empty() &&
+        maps->luminance.size() == maps->elevation.size()) {
+      lowResTeleaInpaintField(&maps->luminance, hole);
+    }
     inpaint_ms = msSince(t0);
   }
 

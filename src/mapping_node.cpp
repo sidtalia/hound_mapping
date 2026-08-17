@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +18,7 @@
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/map_meta_data.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -24,6 +26,7 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -32,6 +35,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <nvblox/nvblox.h>
+#include <nvblox/sensors/pointcloud_to_depth_conversion.h>
 #include <glog/logging.h>
 
 #include "hound_mapping/elevation_cost.hpp"
@@ -173,6 +177,23 @@ bool colorToNvblox(
   return true;
 }
 
+/// All-white RGB = fully traversable (cost stores L=255).
+bool whiteColorImage(
+    int rows, int cols, nvblox::ColorImage* out)
+{
+  if (rows <= 0 || cols <= 0 || out == nullptr) {
+    return false;
+  }
+  *out = nvblox::ColorImage(rows, cols, nvblox::MemoryType::kHost);
+  const nvblox::Color white(255, 255, 255);
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      (*out)(r, c) = white;
+    }
+  }
+  return true;
+}
+
 bool maskToNvblox(
     const sensor_msgs::msg::Image& msg, nvblox::MonoImage* out)
 {
@@ -303,10 +324,43 @@ sensor_msgs::msg::Image matToImageMsg(
   return msg;
 }
 
+/// LocalMap cost [0,255] free-ness → OccupancyGrid (0 free .. 100 lethal).
+/// Unobserved is encoded in cost (SSoT unobserved_luminance, e.g. 128), not a
+/// separate mask — mid values map to mid occupancy.
+nav_msgs::msg::OccupancyGrid costToOccupancyGrid(
+    const cv::Mat& cost, const std_msgs::msg::Header& header, float resolution,
+    float origin_x, float origin_y, float origin_z)
+{
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header = header;
+  grid.info.map_load_time = header.stamp;
+  grid.info.resolution = resolution;
+  grid.info.width = static_cast<uint32_t>(cost.cols);
+  grid.info.height = static_cast<uint32_t>(cost.rows);
+  grid.info.origin.position.x = origin_x;
+  grid.info.origin.position.y = origin_y;
+  grid.info.origin.position.z = origin_z;
+  grid.info.origin.orientation.w = 1.0;
+
+  const int cells = cost.rows * cost.cols;
+  grid.data.resize(static_cast<size_t>(cells));
+  for (int r = 0; r < cost.rows; ++r) {
+    const float* crow = cost.ptr<float>(r);
+    for (int c = 0; c < cost.cols; ++c) {
+      const size_t i = static_cast<size_t>(r) * static_cast<size_t>(cost.cols) +
+                       static_cast<size_t>(c);
+      const float free_l = std::clamp(crow[c], 0.f, 255.f);
+      const float lethal = 1.f - free_l / 255.f;
+      grid.data[i] = static_cast<int8_t>(std::lround(lethal * 100.f));
+    }
+  }
+  return grid;
+}
+
 }  // namespace
 
 /// Single worker thread drains latest sensor slots at mapper_rate_hz:
-/// integrate → BEV on live TSDF/color → inpaint/normals → LocalMap.
+/// integrate → BEV on live TSDF/color → inpaint/slope → LocalMap (elev+cost).
 /// ROS callbacks only overwrite latest message pointers (no mapper access).
 class MappingNode : public rclcpp::Node {
  public:
@@ -335,6 +389,8 @@ class MappingNode : public rclcpp::Node {
         : map_clearing_radius_m_;
     ec.unobserved_luminance = unobserved_luminance_;
     ec.color_weight_min = color_weight_min_;
+    ec.color_z_search_half_band_m = color_z_search_half_band_m_;
+    ec.bev_occ_tsdf_max_m = bev_occ_tsdf_max_m_;
     ec.robot_height_m = robot_height_m_;
     ec.elev_z_min_rel = elev_z_min_rel_;
     ec.elev_z_max_rel = elev_z_max_rel_;
@@ -374,11 +430,24 @@ class MappingNode : public rclcpp::Node {
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+    // Latest-only: nav + RViz only need the newest LocalMap.
     local_map_pub_ =
         create_publisher<hound_mapping::msg::LocalMap>(
-            "~/local_map", rclcpp::QoS(10).reliable());
-    elev_color_pub_ =
-        create_publisher<sensor_msgs::msg::Image>("~/elev_color", 1);
+            "~/local_map", rclcpp::QoS(1).reliable());
+    costmap_pub_ =
+        create_publisher<nav_msgs::msg::OccupancyGrid>("~/costmap", 1);
+    tsdf_color_cloud_pub_ =
+        create_publisher<sensor_msgs::msg::PointCloud2>("~/tsdf_color_cloud", 1);
+    tsdf_color_mesh_pub_ =
+        create_publisher<visualization_msgs::msg::Marker>("~/tsdf_color_mesh", 1);
+    lidar_depth_pub_ =
+        create_publisher<sensor_msgs::msg::Image>("~/lidar_depth_image", 1);
+    lidar_depth_viz_pub_ =
+        create_publisher<sensor_msgs::msg::Image>("~/lidar_depth_viz", 1);
+    lidar_depth_cloud_pub_ =
+        create_publisher<sensor_msgs::msg::PointCloud2>("~/lidar_depth_cloud", 1);
+    lidar_tsdf_probe_pub_ =
+        create_publisher<sensor_msgs::msg::PointCloud2>("~/lidar_tsdf_probe", 1);
     extract_timing_pub_ =
         create_publisher<std_msgs::msg::Float64MultiArray>(
             "~/extract_timing_ms", 10);
@@ -514,12 +583,17 @@ class MappingNode : public rclcpp::Node {
         "hound_mapping ready: depth=%d color=%d lidar=%d voxel=%.3f "
         "local_map=%.1fm clear_r=%.1fm loop1=integrate+BEV@%.1fHz "
         "loop2=inpaint/publish extract_on_depth=%d "
-        "save_layer_cake=~/save_layer_cake path=%s",
+        "debug_semantic_all_traversable=%d "
+        "save_layer_cake=~/save_layer_cake path=%s "
+        "tsdf_color_mesh=%d@%.1fHz "
+        "(~/local_map + ~/costmap + ~/tsdf_color_cloud|mesh)",
         use_depth_, use_color_, use_lidar_, voxel_size_,
         local_map_size_m_ > 0.f ? local_map_size_m_
                                 : (2.f * map_clearing_radius_m_),
         map_clearing_radius_m_, mapper_rate_hz_, extract_on_depth_ ? 1 : 0,
-        layer_cake_path_.empty() ? "(unset)" : layer_cake_path_.c_str());
+        debug_semantic_all_traversable_ ? 1 : 0,
+        layer_cake_path_.empty() ? "(unset)" : layer_cake_path_.c_str(),
+        publish_tsdf_color_mesh_ ? 1 : 0, tsdf_color_mesh_rate_hz_);
   }
 
   ~MappingNode() override
@@ -587,14 +661,21 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("do_inpaint", true);
     declare_parameter("inpaint_resolution_m", 0.25);
     declare_parameter("inpaint_radius", 3);
-    declare_parameter("unobserved_luminance", 0.0);
+    declare_parameter("unobserved_luminance", 128.0);
     declare_parameter("color_weight_min", 0.001);
+    // 0 = auto (2 × voxel_size). Vertical band when sampling ColorVoxel at elev.
+    declare_parameter("color_z_search_half_band_m", 0.0);
+    // BEV: distance <= this counts as occupied (0 = classic TSDF ≤0).
+    declare_parameter("bev_occ_tsdf_max_m", 0.0);
     declare_parameter("robot_height_m", 0.4);
     declare_parameter("elev_z_min_rel", -1.0);
     declare_parameter("elev_z_max_rel", 1.5);
 
     declare_parameter("use_depth", true);
     declare_parameter("use_color", true);
+    // Debug: paint TSDF color all-white (semantic free in FOV).
+    // Unobserved still uses unobserved_luminance (grey outside FOV).
+    declare_parameter("debug_semantic_all_traversable", false);
     declare_parameter("use_lidar", true);
     declare_parameter("use_people_mask", false);
     // Drop bottom of depth image before integrate (0 = keep all, 0.5 = bottom half).
@@ -632,6 +713,14 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("integrate_lidar_rate_hz", 10.0);
     declare_parameter("map_clear_rate_hz", 20.0);
     declare_parameter("log_extract_timing", true);
+    // Debug: publish colored TSDF isosurface (mesh vertices / triangles).
+    declare_parameter("publish_tsdf_color_mesh", false);
+    declare_parameter("tsdf_color_mesh_rate_hz", 1.0);
+    declare_parameter("tsdf_color_mesh_max_triangles", 500000);
+    // Debug: publish nvblox spherical depth image from lidar pointcloud.
+    declare_parameter("publish_lidar_depth_image", false);
+    declare_parameter("publish_lidar_tsdf_probe", false);
+    declare_parameter("lidar_tsdf_probe_max_points", 4000);
     // When true: wake worker ASAP on each new depth (still single-threaded).
     declare_parameter("extract_on_depth", false);
     declare_parameter("dump_elev_dir", "");
@@ -646,6 +735,9 @@ class MappingNode : public rclcpp::Node {
     declare_parameter(
         "prior_xyz_yaw", std::vector<double>{0.0, 0.0, 0.0, 0.0});
     declare_parameter("prior_fill_enabled", true);
+    // TF: bag replay often has sensor stamps a few ms ahead of /tf.
+    declare_parameter("tf_lookup_timeout_s", 0.05);
+    declare_parameter("tf_fallback_to_latest", true);
   }
 
   void loadParams()
@@ -673,6 +765,10 @@ class MappingNode : public rclcpp::Node {
         get_parameter("unobserved_luminance").as_double());
     color_weight_min_ = static_cast<float>(
         get_parameter("color_weight_min").as_double());
+    color_z_search_half_band_m_ = static_cast<float>(
+        get_parameter("color_z_search_half_band_m").as_double());
+    bev_occ_tsdf_max_m_ = static_cast<float>(
+        get_parameter("bev_occ_tsdf_max_m").as_double());
     robot_height_m_ = static_cast<float>(
         get_parameter("robot_height_m").as_double());
     elev_z_min_rel_ = static_cast<float>(
@@ -682,6 +778,8 @@ class MappingNode : public rclcpp::Node {
 
     use_depth_ = get_parameter("use_depth").as_bool();
     use_color_ = get_parameter("use_color").as_bool();
+    debug_semantic_all_traversable_ =
+        get_parameter("debug_semantic_all_traversable").as_bool();
     use_lidar_ = get_parameter("use_lidar").as_bool();
     use_people_mask_ = get_parameter("use_people_mask").as_bool();
     depth_ignore_bottom_fraction_ =
@@ -733,6 +831,18 @@ class MappingNode : public rclcpp::Node {
     (void)integrate_color_rate_hz_;
     map_clear_rate_hz_ = get_parameter("map_clear_rate_hz").as_double();
     log_extract_timing_ = get_parameter("log_extract_timing").as_bool();
+    publish_tsdf_color_mesh_ =
+        get_parameter("publish_tsdf_color_mesh").as_bool();
+    tsdf_color_mesh_rate_hz_ =
+        get_parameter("tsdf_color_mesh_rate_hz").as_double();
+    tsdf_color_mesh_max_triangles_ =
+        get_parameter("tsdf_color_mesh_max_triangles").as_int();
+    publish_lidar_depth_image_ =
+        get_parameter("publish_lidar_depth_image").as_bool();
+    publish_lidar_tsdf_probe_ =
+        get_parameter("publish_lidar_tsdf_probe").as_bool();
+    lidar_tsdf_probe_max_points_ =
+        get_parameter("lidar_tsdf_probe_max_points").as_int();
     extract_on_depth_ = get_parameter("extract_on_depth").as_bool();
     dump_elev_dir_ = get_parameter("dump_elev_dir").as_string();
     dump_elev_rate_hz_ = get_parameter("dump_elev_rate_hz").as_double();
@@ -745,6 +855,8 @@ class MappingNode : public rclcpp::Node {
       prior_xyz_yaw_ = {0.0, 0.0, 0.0, 0.0};
     }
     prior_fill_enabled_ = get_parameter("prior_fill_enabled").as_bool();
+    tf_lookup_timeout_s_ = get_parameter("tf_lookup_timeout_s").as_double();
+    tf_fallback_to_latest_ = get_parameter("tf_fallback_to_latest").as_bool();
     if (!dump_elev_dir_.empty()) {
       RCLCPP_INFO(
           get_logger(), "dump_elev_dir=%s rate=%.3fHz n_frames=%d",
@@ -857,12 +969,32 @@ class MappingNode : public rclcpp::Node {
       const std::string& target, const std::string& source,
       const rclcpp::Time& stamp, nvblox::Transform* T_target_source)
   {
+    const auto timeout =
+        rclcpp::Duration::from_seconds(std::max(0.0, tf_lookup_timeout_s_));
     try {
       const auto tf = tf_buffer_->lookupTransform(
-          target, source, stamp, rclcpp::Duration::from_seconds(0.05));
+          target, source, stamp, timeout);
       *T_target_source = toNvblox(tf2::transformToEigen(tf.transform));
       return true;
     } catch (const tf2::TransformException& ex) {
+      if (tf_fallback_to_latest_) {
+        try {
+          // TimePointZero = latest; tolerates bag TF lag / slight stamp skew.
+          const auto tf = tf_buffer_->lookupTransform(
+              target, source, rclcpp::Time(0, 0, RCL_ROS_TIME));
+          *T_target_source = toNvblox(tf2::transformToEigen(tf.transform));
+          RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 5000,
+              "TF %s <- %s: using latest (stamp lookup failed: %s)",
+              target.c_str(), source.c_str(), ex.what());
+          return true;
+        } catch (const tf2::TransformException& ex2) {
+          RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 2000, "TF %s <- %s failed: %s",
+              target.c_str(), source.c_str(), ex2.what());
+          return false;
+        }
+      }
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000, "TF %s <- %s failed: %s",
           target.c_str(), source.c_str(), ex.what());
@@ -1045,6 +1177,8 @@ class MappingNode : public rclcpp::Node {
             }
             mapper_->integrateLidar(
                 cloud, T_L_S, lidar_, do_mc, T_end, duration);
+            maybePublishLidarDepthImage(
+                cloud, T_L_S, do_mc, T_end, duration, lidar_msg->header);
             if (stamp_for_map.nanoseconds() == 0) {
               stamp_for_map = lidar_msg->header.stamp;
             }
@@ -1076,7 +1210,15 @@ class MappingNode : public rclcpp::Node {
               global_frame_, pc.color_msg->header.frame_id,
               pc.color_msg->header.stamp, &T_L_C)) {
         nvblox::ColorImage color(nvblox::MemoryType::kHost);
-        if (colorToNvblox(*pc.color_msg, &color)) {
+        bool ok = false;
+        if (debug_semantic_all_traversable_) {
+          ok = whiteColorImage(
+              static_cast<int>(pc.color_msg->height),
+              static_cast<int>(pc.color_msg->width), &color);
+        } else {
+          ok = colorToNvblox(*pc.color_msg, &color);
+        }
+        if (ok) {
           mapper_->integrateColor(color, T_L_C, *pc.color_cam);
           pc.slot->last_color_ns = ns;
           if (stamp_for_map.nanoseconds() == 0) {
@@ -1137,6 +1279,8 @@ class MappingNode : public rclcpp::Node {
     }
     pub_cv_.notify_one();
 
+    maybePublishTsdfColorMesh(stamp);
+
     const double loop1_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t_all)
             .count();
@@ -1195,27 +1339,507 @@ class MappingNode : public rclcpp::Node {
       header.stamp = job.stamp;
       header.frame_id = global_frame_;
 
-      hound_mapping::msg::LocalMap local_map;
-      local_map.header = header;
-      local_map.info.map_load_time = job.stamp;
-      local_map.info.resolution = job.maps.resolution;
-      local_map.info.width = static_cast<uint32_t>(job.maps.width);
-      local_map.info.height = static_cast<uint32_t>(job.maps.height);
-      local_map.info.origin.position.x = job.maps.origin_x;
-      local_map.info.origin.position.y = job.maps.origin_y;
-      local_map.info.origin.position.z = job.clearing_z;
-      local_map.info.origin.orientation.w = 1.0;
-      local_map.elevation =
-          matToImageMsg(job.maps.elevation, header, "32FC1");
-      local_map.costmap = matToImageMsg(job.maps.cost, header, "32FC1");
-      local_map.normals = matToImageMsg(job.maps.normals, header, "32FC3");
-      local_map.observed = matToImageMsg(job.maps.observed, header, "mono8");
-      local_map_pub_->publish(local_map);
+      // Skip serialize/publish when nobody is listening (RViz/nav off).
+      const size_t local_subs =
+          local_map_pub_->get_subscription_count() +
+          local_map_pub_->get_intra_process_subscription_count();
+      if (local_subs > 0) {
+        hound_mapping::msg::LocalMap local_map;
+        local_map.header = header;
+        local_map.info.map_load_time = job.stamp;
+        local_map.info.resolution = job.maps.resolution;
+        local_map.info.width = static_cast<uint32_t>(job.maps.width);
+        local_map.info.height = static_cast<uint32_t>(job.maps.height);
+        local_map.info.origin.position.x = job.maps.origin_x;
+        local_map.info.origin.position.y = job.maps.origin_y;
+        local_map.info.origin.position.z = job.clearing_z;
+        local_map.info.origin.orientation.w = 1.0;
+        local_map.elevation =
+            matToImageMsg(job.maps.elevation, header, "32FC1");
+        local_map.costmap = matToImageMsg(job.maps.cost, header, "32FC1");
+        local_map_pub_->publish(std::move(local_map));
+      }
 
-      elev_color_pub_->publish(
-          matToImageMsg(job.maps.elev_color, header, "bgr8"));
+      const size_t cost_subs =
+          costmap_pub_->get_subscription_count() +
+          costmap_pub_->get_intra_process_subscription_count();
+      if (cost_subs > 0) {
+        costmap_pub_->publish(costToOccupancyGrid(
+            job.maps.cost, header, job.maps.resolution, job.maps.origin_x,
+            job.maps.origin_y, job.clearing_z));
+      }
       maybeDumpElev(job.stamp, job.maps);
     }
+  }
+
+  void maybePublishLidarDepthImage(
+      const nvblox::Pointcloud& cloud, const nvblox::Transform& T_L_S,
+      bool do_mc, const std::optional<nvblox::Transform>& T_end,
+      const std::optional<nvblox::Time>& duration,
+      const std_msgs::msg::Header& cloud_header)
+  {
+    if (!publish_lidar_depth_image_ && !publish_lidar_tsdf_probe_) {
+      return;
+    }
+    const bool need_depth =
+        publish_lidar_depth_image_ &&
+        lidar_depth_pub_->get_subscription_count() > 0;
+    const bool need_viz =
+        publish_lidar_depth_image_ &&
+        lidar_depth_viz_pub_->get_subscription_count() > 0;
+    const bool need_cloud =
+        publish_lidar_depth_image_ &&
+        lidar_depth_cloud_pub_->get_subscription_count() > 0;
+    const bool need_probe =
+        publish_lidar_tsdf_probe_ &&
+        lidar_tsdf_probe_pub_->get_subscription_count() > 0;
+    if (!need_depth && !need_viz && !need_cloud && !need_probe) {
+      return;
+    }
+
+    nvblox::DepthImage depth_device(nvblox::MemoryType::kDevice);
+    nvblox::depthImageFromPointcloudGPU(
+        cloud, T_L_S, lidar_, do_mc, T_end, duration, &depth_device,
+        *lidar_stream_);
+    lidar_stream_->synchronize();
+
+    nvblox::DepthImage depth_host(nvblox::MemoryType::kHost);
+    depth_host.copyFromAsync(depth_device, *lidar_stream_);
+    lidar_stream_->synchronize();
+
+    const int rows = depth_host.rows();
+    const int cols = depth_host.cols();
+    if (rows <= 0 || cols <= 0) {
+      return;
+    }
+
+    std_msgs::msg::Header header = cloud_header;
+    header.frame_id = cloud_header.frame_id;
+
+    if (need_depth) {
+      sensor_msgs::msg::Image msg;
+      msg.header = header;
+      msg.height = static_cast<uint32_t>(rows);
+      msg.width = static_cast<uint32_t>(cols);
+      msg.encoding = "32FC1";
+      msg.is_bigendian = false;
+      msg.step = static_cast<uint32_t>(cols * sizeof(float));
+      msg.data.resize(static_cast<size_t>(rows) * msg.step);
+      for (int r = 0; r < rows; ++r) {
+        std::memcpy(
+            msg.data.data() + static_cast<size_t>(r) * msg.step,
+            depth_host.dataConstPtr() + static_cast<size_t>(r) * cols,
+            static_cast<size_t>(cols) * sizeof(float));
+      }
+      lidar_depth_pub_->publish(msg);
+    }
+
+    if (need_viz) {
+      // Normalize valid depths to mono8; invalid/empty → 0 (black gaps).
+      float dmin = std::numeric_limits<float>::max();
+      float dmax = 0.f;
+      for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+          const float d = depth_host(r, c);
+          if (d > 0.f && std::isfinite(d)) {
+            dmin = std::min(dmin, d);
+            dmax = std::max(dmax, d);
+          }
+        }
+      }
+      const float span = (dmax > dmin) ? (dmax - dmin) : 1.f;
+      sensor_msgs::msg::Image msg;
+      msg.header = header;
+      msg.height = static_cast<uint32_t>(rows);
+      msg.width = static_cast<uint32_t>(cols);
+      msg.encoding = "mono8";
+      msg.is_bigendian = false;
+      msg.step = static_cast<uint32_t>(cols);
+      msg.data.resize(static_cast<size_t>(rows) * cols);
+      for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+          const float d = depth_host(r, c);
+          uint8_t v = 0;
+          if (d > 0.f && std::isfinite(d)) {
+            v = static_cast<uint8_t>(
+                std::clamp((d - dmin) / span * 255.f, 0.f, 255.f));
+          }
+          msg.data[static_cast<size_t>(r) * cols + c] = v;
+        }
+      }
+      lidar_depth_viz_pub_->publish(msg);
+    }
+
+    if (need_cloud) {
+      // Unproject filled spherical pixels → pointcloud in lidar frame
+      // (same frame as raw /livox/cloud). Empty bins produce no points.
+      std::vector<float> xyz;
+      xyz.reserve(static_cast<size_t>(rows) * cols * 3 / 4);
+      for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+          const float d = depth_host(r, c);
+          if (!(d > 0.f) || !std::isfinite(d)) {
+            continue;
+          }
+          const nvblox::Vector3f p =
+              lidar_.unprojectFromPixelIndices(nvblox::Index2D(c, r), d);
+          xyz.push_back(p.x());
+          xyz.push_back(p.y());
+          xyz.push_back(p.z());
+        }
+      }
+      const size_t n = xyz.size() / 3;
+      sensor_msgs::msg::PointCloud2 out;
+      out.header = header;
+      out.height = 1;
+      out.width = static_cast<uint32_t>(n);
+      out.is_dense = true;
+      out.is_bigendian = false;
+      sensor_msgs::PointCloud2Modifier mod(out);
+      mod.setPointCloud2FieldsByString(1, "xyz");
+      mod.resize(n);
+      sensor_msgs::PointCloud2Iterator<float> iter_x(out, "x");
+      sensor_msgs::PointCloud2Iterator<float> iter_y(out, "y");
+      sensor_msgs::PointCloud2Iterator<float> iter_z(out, "z");
+      for (size_t i = 0; i < n; ++i, ++iter_x, ++iter_y, ++iter_z) {
+        *iter_x = xyz[i * 3 + 0];
+        *iter_y = xyz[i * 3 + 1];
+        *iter_z = xyz[i * 3 + 2];
+      }
+      lidar_depth_cloud_pub_->publish(out);
+    }
+
+    if (need_probe) {
+      // Query TSDF at reprojected hits + 6 face neighbors (layer frame).
+      // RGB focuses on what marching cubes needs (local sign change):
+      //   red=no block, yellow=weight≈0,
+      //   green=local +/- straddles 0 (meshable),
+      //   magenta=weight>0 but no local zero-crossing (won't mesh).
+      constexpr float kMinWeight = 1e-4f;
+      const float vs = std::max(voxel_size_, 1e-3f);
+      const nvblox::Vector3f neighbor_off[7] = {
+          {0.f, 0.f, 0.f}, {vs, 0.f, 0.f},  {-vs, 0.f, 0.f},
+          {0.f, vs, 0.f},  {0.f, -vs, 0.f}, {0.f, 0.f, vs},
+          {0.f, 0.f, -vs}};
+
+      std::vector<nvblox::Vector3f> hit_L;
+      hit_L.reserve(static_cast<size_t>(
+          std::max(1, lidar_tsdf_probe_max_points_)));
+      const int max_pts = std::max(1, lidar_tsdf_probe_max_points_);
+      int n_valid = 0;
+      for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+          const float d = depth_host(r, c);
+          if (d > 0.f && std::isfinite(d)) {
+            ++n_valid;
+          }
+        }
+      }
+      const int stride =
+          std::max(1, (n_valid + max_pts - 1) / max_pts);
+      int seen = 0;
+      for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+          const float d = depth_host(r, c);
+          if (!(d > 0.f) || !std::isfinite(d)) {
+            continue;
+          }
+          if ((seen++ % stride) != 0) {
+            continue;
+          }
+          const nvblox::Vector3f p_S =
+              lidar_.unprojectFromPixelIndices(nvblox::Index2D(c, r), d);
+          hit_L.push_back(T_L_S * p_S);
+          if (static_cast<int>(hit_L.size()) >= max_pts) {
+            break;
+          }
+        }
+        if (static_cast<int>(hit_L.size()) >= max_pts) {
+          break;
+        }
+      }
+
+      std::vector<nvblox::Vector3f> query_L;
+      query_L.reserve(hit_L.size() * 7);
+      for (const auto& p : hit_L) {
+        for (const auto& o : neighbor_off) {
+          query_L.push_back(p + o);
+        }
+      }
+
+      std::vector<nvblox::TsdfVoxel> voxels;
+      std::vector<bool> ok;
+      mapper_->mapper().tsdf_layer().getVoxels(
+          query_L, &voxels, &ok, lidar_stream_.get());
+
+      size_t n_none = 0;
+      size_t n_w0 = 0;
+      size_t n_cross = 0;
+      size_t n_all_pos = 0;
+      size_t n_all_neg = 0;
+      size_t n_isolated = 0;
+      double sum_abs_cross = 0.0;
+      double sum_abs_nocross = 0.0;
+      double sum_w_nocross = 0.0;
+
+      sensor_msgs::msg::PointCloud2 out;
+      out.header.stamp = cloud_header.stamp;
+      out.header.frame_id = global_frame_;
+      out.height = 1;
+      out.width = static_cast<uint32_t>(hit_L.size());
+      out.is_dense = true;
+      out.is_bigendian = false;
+      sensor_msgs::PointCloud2Modifier mod(out);
+      mod.setPointCloud2FieldsByString(2, "xyz", "rgb");
+      mod.resize(hit_L.size());
+      sensor_msgs::PointCloud2Iterator<float> iter_x(out, "x");
+      sensor_msgs::PointCloud2Iterator<float> iter_y(out, "y");
+      sensor_msgs::PointCloud2Iterator<float> iter_z(out, "z");
+      sensor_msgs::PointCloud2Iterator<float> iter_rgb(out, "rgb");
+
+      auto pack_rgb = [](uint8_t r, uint8_t g, uint8_t b) {
+        const uint32_t packed =
+            (static_cast<uint32_t>(r) << 16) |
+            (static_cast<uint32_t>(g) << 8) |
+            static_cast<uint32_t>(b);
+        float f = 0.f;
+        std::memcpy(&f, &packed, sizeof(float));
+        return f;
+      };
+
+      for (size_t i = 0; i < hit_L.size();
+           ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_rgb) {
+        *iter_x = hit_L[i].x();
+        *iter_y = hit_L[i].y();
+        *iter_z = hit_L[i].z();
+        const size_t base = i * 7;
+        float rgb = 0.f;
+        if (!ok[base]) {
+          ++n_none;
+          rgb = pack_rgb(255, 40, 40);  // red: no block at hit
+        } else if (voxels[base].weight < kMinWeight) {
+          ++n_w0;
+          rgb = pack_rgb(255, 200, 0);  // yellow: weight ≈ 0
+        } else {
+          bool has_pos = false;
+          bool has_neg = false;
+          int n_weighted = 0;
+          for (size_t k = 0; k < 7; ++k) {
+            if (!ok[base + k] || voxels[base + k].weight < kMinWeight) {
+              continue;
+            }
+            ++n_weighted;
+            if (voxels[base + k].distance >= 0.f) {
+              has_pos = true;
+            } else {
+              has_neg = true;
+            }
+          }
+          const float abs_d = std::fabs(voxels[base].distance);
+          if (has_pos && has_neg) {
+            ++n_cross;
+            sum_abs_cross += abs_d;
+            rgb = pack_rgb(40, 220, 40);  // green: local zero-crossing
+          } else if (n_weighted <= 1) {
+            ++n_isolated;
+            sum_abs_nocross += abs_d;
+            sum_w_nocross += voxels[base].weight;
+            rgb = pack_rgb(255, 140, 0);  // orange: only this voxel weighted
+          } else if (has_pos) {
+            ++n_all_pos;
+            sum_abs_nocross += abs_d;
+            sum_w_nocross += voxels[base].weight;
+            rgb = pack_rgb(255, 0, 255);  // magenta: all free (+)
+          } else {
+            ++n_all_neg;
+            sum_abs_nocross += abs_d;
+            sum_w_nocross += voxels[base].weight;
+            rgb = pack_rgb(0, 160, 255);  // blue: all occupied (-)
+          }
+        }
+        *iter_rgb = rgb;
+      }
+      lidar_tsdf_probe_pub_->publish(out);
+
+      const size_t n_nocross = n_all_pos + n_all_neg + n_isolated;
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "lidar_tsdf_probe: samples=%zu none=%zu(red) w0=%zu(yellow) "
+          "cross=%zu(green) all+=%zu(magenta) all-=%zu(blue) "
+          "isolated=%zu(orange) |d|_cross=%.3f |d|_nocross=%.3f "
+          "w_nocross=%.2f stride=%d bins=%d",
+          hit_L.size(), n_none, n_w0, n_cross, n_all_pos, n_all_neg,
+          n_isolated,
+          n_cross ? sum_abs_cross / static_cast<double>(n_cross) : 0.0,
+          n_nocross ? sum_abs_nocross / static_cast<double>(n_nocross)
+                    : 0.0,
+          n_nocross ? sum_w_nocross / static_cast<double>(n_nocross) : 0.0,
+          stride, n_valid);
+    }
+  }
+
+  void maybePublishTsdfColorMesh(const rclcpp::Time& stamp)
+  {
+    if (!publish_tsdf_color_mesh_) {
+      return;
+    }
+    if (!rateOk(&last_tsdf_color_mesh_, tsdf_color_mesh_rate_hz_, stamp)) {
+      return;
+    }
+    // Only pay for mesh update if someone is listening.
+    const bool need_cloud = tsdf_color_cloud_pub_->get_subscription_count() > 0;
+    const bool need_mesh = tsdf_color_mesh_pub_->get_subscription_count() > 0;
+    if (!need_cloud && !need_mesh) {
+      return;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+
+    // Mesh blocks are not reliably host-accessible; serialize to host_vector.
+    mapper_->mapper().updateColorMesh(nvblox::UpdateFullLayer::kYes);
+    const std::vector<nvblox::Index3D> block_ids =
+        mapper_->mapper().color_mesh_layer().getAllBlockIndices();
+    if (block_ids.empty()) {
+      return;
+    }
+    mapper_->mapper().serializeSelectedLayers(
+        nvblox::LayerTypeBitMask(nvblox::LayerType::kColorMesh),
+        /*bandwidth_limit_mbps=*/-1.f, nvblox::BlockExclusionParams(),
+        block_ids);
+    const std::shared_ptr<nvblox::SerializedColorMeshLayer> serialized =
+        mapper_->mapper().serializedColorMeshLayer();
+    if (!serialized || serialized->vertices.empty()) {
+      return;
+    }
+
+    const size_t n_verts = serialized->vertices.size();
+    const size_t n_tri_idx = serialized->triangle_indices.size();
+    const size_t n_tris = n_tri_idx / 3;
+    const bool have_c = serialized->vertex_appearances.size() == n_verts;
+
+    std_msgs::msg::Header header;
+    header.stamp = stamp;
+    header.frame_id = global_frame_;
+
+    if (need_cloud) {
+      sensor_msgs::msg::PointCloud2 cloud;
+      cloud.header = header;
+      cloud.height = 1;
+      cloud.width = static_cast<uint32_t>(n_verts);
+      cloud.is_dense = false;
+      cloud.is_bigendian = false;
+      sensor_msgs::PointCloud2Modifier mod(cloud);
+      mod.setPointCloud2FieldsByString(2, "xyz", "rgb");
+      mod.resize(n_verts);
+      sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+      sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+      sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+      sensor_msgs::PointCloud2Iterator<float> iter_rgb(cloud, "rgb");
+      for (size_t i = 0; i < n_verts; ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_rgb) {
+        const auto& v = serialized->vertices[i];
+        *iter_x = v.x();
+        *iter_y = v.y();
+        *iter_z = v.z();
+        uint8_t r = 200, g = 200, b = 200;
+        if (have_c) {
+          const auto& c = serialized->vertex_appearances[i];
+          r = c.r();
+          g = c.g();
+          b = c.b();
+        }
+        const uint32_t packed =
+            (static_cast<uint32_t>(r) << 16) |
+            (static_cast<uint32_t>(g) << 8) |
+            static_cast<uint32_t>(b);
+        std::memcpy(&(*iter_rgb), &packed, sizeof(float));
+      }
+      tsdf_color_cloud_pub_->publish(cloud);
+    }
+
+    if (need_mesh && n_tris > 0 &&
+        serialized->vertex_block_offsets.size() >= 2 &&
+        serialized->triangle_index_block_offsets.size() >= 2) {
+      const size_t max_tris =
+          tsdf_color_mesh_max_triangles_ > 0
+              ? static_cast<size_t>(tsdf_color_mesh_max_triangles_)
+              : n_tris;
+      visualization_msgs::msg::Marker marker;
+      marker.header = header;
+      marker.ns = "tsdf_color_mesh";
+      marker.id = 0;
+      marker.type = visualization_msgs::msg::Marker::TRIANGLE_LIST;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = 1.0;
+      marker.scale.y = 1.0;
+      marker.scale.z = 1.0;
+      marker.points.reserve(std::min(n_tris, max_tris) * 3);
+      marker.colors.reserve(std::min(n_tris, max_tris) * 3);
+
+      size_t emitted = 0;
+      const size_t n_blocks = serialized->block_indices.size();
+      for (size_t bi = 0; bi < n_blocks && emitted < max_tris; ++bi) {
+        if (bi + 1 >= serialized->vertex_block_offsets.size() ||
+            bi + 1 >= serialized->triangle_index_block_offsets.size()) {
+          break;
+        }
+        const size_t v_base =
+            static_cast<size_t>(serialized->vertex_block_offsets[bi]);
+        const size_t t0 =
+            static_cast<size_t>(serialized->triangle_index_block_offsets[bi]);
+        const size_t t1 = static_cast<size_t>(
+            serialized->triangle_index_block_offsets[bi + 1]);
+        for (size_t t = t0; t + 2 < t1 && emitted < max_tris; t += 3, ++emitted) {
+          bool ok = true;
+          geometry_msgs::msg::Point pts[3];
+          std_msgs::msg::ColorRGBA cols[3];
+          for (int k = 0; k < 3; ++k) {
+            const int local =
+                serialized->triangle_indices[t + static_cast<size_t>(k)];
+            if (local < 0) {
+              ok = false;
+              break;
+            }
+            const size_t vi = v_base + static_cast<size_t>(local);
+            if (vi >= n_verts) {
+              ok = false;
+              break;
+            }
+            const auto& v = serialized->vertices[vi];
+            pts[k].x = v.x();
+            pts[k].y = v.y();
+            pts[k].z = v.z();
+            cols[k].a = 1.f;
+            if (have_c) {
+              const auto& c = serialized->vertex_appearances[vi];
+              cols[k].r = c.r() / 255.f;
+              cols[k].g = c.g() / 255.f;
+              cols[k].b = c.b() / 255.f;
+            } else {
+              cols[k].r = cols[k].g = cols[k].b = 0.8f;
+            }
+          }
+          if (!ok) {
+            continue;
+          }
+          for (int k = 0; k < 3; ++k) {
+            marker.points.push_back(pts[k]);
+            marker.colors.push_back(cols[k]);
+          }
+        }
+      }
+      if (!marker.points.empty()) {
+        tsdf_color_mesh_pub_->publish(marker);
+      }
+    }
+
+    const double ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "tsdf_color_mesh: blocks=%zu verts=%zu tris=%zu in %.1fms",
+        block_ids.size(), n_verts, n_tris, ms);
   }
 
   void maybeSaveLayerCake()
@@ -1343,13 +1967,16 @@ class MappingNode : public rclcpp::Node {
   bool do_inpaint_{true};
   float inpaint_resolution_m_{0.25f};
   int inpaint_radius_{3};
-  float unobserved_luminance_{0.f};
+  float unobserved_luminance_{128.f};
   float color_weight_min_{1e-3f};
+  float color_z_search_half_band_m_{0.f};
+  float bev_occ_tsdf_max_m_{0.f};
   float robot_height_m_{0.4f};
   float elev_z_min_rel_{-1.f};
   float elev_z_max_rel_{1.5f};
   bool use_depth_{true};
   bool use_color_{true};
+  bool debug_semantic_all_traversable_{false};
   bool use_lidar_{true};
   bool use_people_mask_{false};
   double depth_ignore_bottom_fraction_{0.0};
@@ -1377,6 +2004,12 @@ class MappingNode : public rclcpp::Node {
   double integrate_color_rate_hz_{20.0};
   double integrate_lidar_rate_hz_{10.0};
   bool log_extract_timing_{true};
+  bool publish_tsdf_color_mesh_{false};
+  double tsdf_color_mesh_rate_hz_{1.0};
+  int tsdf_color_mesh_max_triangles_{500000};
+  bool publish_lidar_depth_image_{false};
+  bool publish_lidar_tsdf_probe_{false};
+  int lidar_tsdf_probe_max_points_{4000};
   double map_clear_rate_hz_{20.0};
   bool extract_on_depth_{false};
   std::string dump_elev_dir_;
@@ -1386,6 +2019,8 @@ class MappingNode : public rclcpp::Node {
   std::string prior_layer_cake_path_;
   std::vector<double> prior_xyz_yaw_{0.0, 0.0, 0.0, 0.0};
   bool prior_fill_enabled_{true};
+  double tf_lookup_timeout_s_{0.05};
+  bool tf_fallback_to_latest_{false};
 
   std::unique_ptr<MapperCore> mapper_;
   std::unique_ptr<ElevationCostExtractor> extractor_;
@@ -1402,7 +2037,17 @@ class MappingNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;
   rclcpp::Publisher<hound_mapping::msg::LocalMap>::SharedPtr local_map_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr elev_color_pub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+      tsdf_color_cloud_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr
+      tsdf_color_mesh_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr lidar_depth_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr lidar_depth_viz_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+      lidar_depth_cloud_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+      lidar_tsdf_probe_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
       extract_timing_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_srv_;
@@ -1413,6 +2058,7 @@ class MappingNode : public rclcpp::Node {
 
   rclcpp::Time last_lidar_integrate_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_clear_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_tsdf_color_mesh_{0, 0, RCL_ROS_TIME};
 
   std::thread worker_thread_;
   std::mutex wake_mutex_;

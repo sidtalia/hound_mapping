@@ -18,9 +18,13 @@ struct ElevationCostConfig {
   float resolution_m = 0.05f;
   float window_radius_m = 32.0f;
   float tsdf_weight_min = 1e-3f;
+  /// See TsdfColorToBevParams::bev_occ_tsdf_max_m.
+  float bev_occ_tsdf_max_m = 0.f;
   float robot_height_m = 0.4f;
-  float unobserved_luminance = 0.f;
+  float unobserved_luminance = 128.f;
   float color_weight_min = 1e-3f;
+  /// See TsdfColorToBevParams::color_z_search_half_band_m (0 = auto).
+  float color_z_search_half_band_m = 0.f;
   float elev_z_min_rel = -5.0f;
   float elev_z_max_rel = 2.0f;
   float lethal_slope_deg = 60.f;
@@ -34,7 +38,7 @@ struct ElevationCostConfig {
 struct LocalMaps {
   cv::Mat elevation;   // world Z; unknowns filled if do_inpaint
   cv::Mat observed;    // 255 = TSDF-observed surface (pre-inpaint)
-  cv::Mat cost;        // [0,1], semantic OR slope (unknowns: slope only)
+  cv::Mat cost;        // [0,255] free-ness (255 free / 0 lethal; semantic OR slope)
   cv::Mat normals;     // HxWx3 unit normals (after inpaint)
   cv::Mat luminance;
   cv::Mat elev_color;  // BGR viz from luminance (debug topic)
@@ -83,7 +87,7 @@ class ElevationCostExtractor {
       float z_max, float unknown_elev_z, ExtractTiming* timing = nullptr,
       bool use_prior = true);
 
-  /// Loop2: inpaint elev → slope/normals → elev_color. Mutates maps in place.
+  /// Loop2: inpaint elev+cost(+lum) → slope/normals → elev_color.
   void finishLocalMap(LocalMaps* maps, ExtractTiming* timing = nullptr);
 
   /// Full pipeline (BEV + finish). Used by offline smoke tools.
@@ -99,6 +103,8 @@ class ElevationCostExtractor {
  private:
   void ensureHost(int width, int height);
   void colorizeFromLuminance(const cv::Mat& luminance, cv::Mat* elev_color);
+  /// Telea-fill holes (mask 255) at low res; write back only where mask.
+  void lowResTeleaInpaintField(cv::Mat* field, const cv::Mat& hole_mask);
   void lowResTeleaInpaintElev(cv::Mat* elevation, const cv::Mat& observed);
 
   ElevationCostConfig config_;

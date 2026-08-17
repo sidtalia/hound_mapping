@@ -62,6 +62,6 @@ python3 scripts/viser_rail_compare.py --dataset data/rail_sim/race-2 --port 8081
 
 | Topic | Type | Notes |
 |-------|------|--------|
-| `~/local_map` | `LocalMap` | elev, costmap `[0,1]`, normals, observed |
+| `~/local_map` | `LocalMap` | elev + costmap free-ness `[0,255]` (128≈unobserved) |
 | `~/elev_color` | `Image` bgr8 | luminance viz (debug) |
 | `~/extract_timing_ms` | `Float64MultiArray` | `[bev, snapshot, inpaint, slope, colorize, total]` ms |

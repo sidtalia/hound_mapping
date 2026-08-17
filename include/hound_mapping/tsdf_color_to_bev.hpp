@@ -24,9 +24,17 @@ struct TsdfColorToBevParams {
   float robot_height_m = 0.4f;
   /// Min TSDF weight to treat a voxel as observed.
   float tsdf_weight_min = 1e-3f;
-  /// Luminance written when ColorVoxel missing / low weight (0 → lethal cost).
-  float unobserved_luminance = 0.f;
+  /// BEV treats distance <= this as occupied (meters). 0 = strict TSDF ≤0.
+  /// Slightly positive values pull near-surface free-side voxels into the
+  /// floor finder (fixes elev holes from projective lidar one-sided TSDF).
+  float bev_occ_tsdf_max_m = 0.f;
+  /// Luminance/cost when ColorVoxel missing or no floor (0–255, from SSoT
+  /// ``unobserved_luminance``). Typical: 128 = unknown gray, 255 = treat as free.
+  float unobserved_luminance = 128.f;
   float color_weight_min = 1e-3f;
+  /// Vertical half-band (m) around elev floor when sampling ColorVoxel.
+  /// 0 → auto (2 × TSDF voxel size). Fixes grey holes from Z mismatch.
+  float color_z_search_half_band_m = 0.f;
   /// Unused in tsdf_color_to_bev; passed through for callers that also slope.
   float lethal_slope_deg = 60.f;
 };
@@ -67,8 +75,7 @@ void tsdf_color_to_bev(
     uint8_t* observed_host, const nvblox::CudaStream& cuda_stream,
     const PriorBevGpu* prior = nullptr);
 
-/// GPU normals from elev + slope OR into cost. Unobserved cells get cost =
-/// slope_lethal only (semantic lethality cleared after elev inpaint).
+/// GPU normals from elev + slope forces free-ness cost to 0 when lethal.
 void apply_slope_normals_cost(
     TsdfColorToBevWorkspace* workspace, int width, int height, float resolution,
     float lethal_slope_deg, float* elev_host, float* cost_host,
