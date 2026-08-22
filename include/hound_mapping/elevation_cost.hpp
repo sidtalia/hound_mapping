@@ -25,6 +25,8 @@ struct ElevationCostConfig {
   float color_weight_min = 1e-3f;
   /// See TsdfColorToBevParams::color_z_search_half_band_m (0 = auto).
   float color_z_search_half_band_m = 0.f;
+  /// See TsdfColorToBevParams::color_z_column_above_m (0 = full BEV Z span).
+  float color_z_column_above_m = 0.f;
   float elev_z_min_rel = -5.0f;
   float elev_z_max_rel = 2.0f;
   float lethal_slope_deg = 60.f;

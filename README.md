@@ -3,6 +3,10 @@
 nvblox **TSDF** integrate + GPU **TSDF→BEV** elevation / cost / normals for HOUND.
 Publishes `LocalMap` (robot-centered, odom axes — not yaw-rotated). No ESDF layer.
 
+## Known issue: color projection
+
+Projective color into the TSDF often looks wrong (missing / magenta / misaligned on occupied voxels). Root cause is unclear (`camera_info`, TF timing, integrate vs LiDAR surface, QoS, …). Treat `~/tsdf_voxels` color as suspect until investigated under controlled replay. Noted in `hound_core/config/SSoT.yaml` (`nvblox`) and `hound_core/docs/context.md`.
+
 ## Hotpath
 
 ```

@@ -171,6 +171,7 @@ LocalMaps ElevationCostExtractor::extractBevGrid(
   p.unobserved_luminance = config_.unobserved_luminance;
   p.color_weight_min = config_.color_weight_min;
   p.color_z_search_half_band_m = config_.color_z_search_half_band_m;
+  p.color_z_column_above_m = config_.color_z_column_above_m;
   p.lethal_slope_deg = config_.lethal_slope_deg;
 
   const PriorBevGpu* prior_arg =
@@ -241,14 +242,7 @@ void ElevationCostExtractor::finishLocalMap(
     cv::Mat hole;
     cv::compare(maps->observed, 0, hole, cv::CMP_EQ);
     lowResTeleaInpaintField(&maps->elevation, hole);
-    // Same holes as elev: pull cost/lum from neighbors (no leftover grey).
-    if (!maps->cost.empty() && maps->cost.size() == maps->elevation.size()) {
-      lowResTeleaInpaintField(&maps->cost, hole);
-    }
-    if (!maps->luminance.empty() &&
-        maps->luminance.size() == maps->elevation.size()) {
-      lowResTeleaInpaintField(&maps->luminance, hole);
-    }
+    // Do not inpaint cost/luminance — those come from the BEV kernel.
     inpaint_ms = msSince(t0);
   }
 

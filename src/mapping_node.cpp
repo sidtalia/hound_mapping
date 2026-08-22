@@ -390,6 +390,7 @@ class MappingNode : public rclcpp::Node {
     ec.unobserved_luminance = unobserved_luminance_;
     ec.color_weight_min = color_weight_min_;
     ec.color_z_search_half_band_m = color_z_search_half_band_m_;
+    ec.color_z_column_above_m = color_z_column_above_m_;
     ec.bev_occ_tsdf_max_m = bev_occ_tsdf_max_m_;
     ec.robot_height_m = robot_height_m_;
     ec.elev_z_min_rel = elev_z_min_rel_;
@@ -448,6 +449,8 @@ class MappingNode : public rclcpp::Node {
         create_publisher<sensor_msgs::msg::PointCloud2>("~/lidar_depth_cloud", 1);
     lidar_tsdf_probe_pub_ =
         create_publisher<sensor_msgs::msg::PointCloud2>("~/lidar_tsdf_probe", 1);
+    tsdf_voxels_pub_ =
+        create_publisher<sensor_msgs::msg::PointCloud2>("~/tsdf_voxels", 1);
     extract_timing_pub_ =
         create_publisher<std_msgs::msg::Float64MultiArray>(
             "~/extract_timing_ms", 10);
@@ -585,15 +588,16 @@ class MappingNode : public rclcpp::Node {
         "loop2=inpaint/publish extract_on_depth=%d "
         "debug_semantic_all_traversable=%d "
         "save_layer_cake=~/save_layer_cake path=%s "
-        "tsdf_color_mesh=%d@%.1fHz "
-        "(~/local_map + ~/costmap + ~/tsdf_color_cloud|mesh)",
+        "tsdf_color_mesh=%d@%.1fHz tsdf_voxels=%d@%.1fHz "
+        "(~/local_map + ~/costmap + ~/tsdf_color_cloud|mesh|~/tsdf_voxels)",
         use_depth_, use_color_, use_lidar_, voxel_size_,
         local_map_size_m_ > 0.f ? local_map_size_m_
                                 : (2.f * map_clearing_radius_m_),
         map_clearing_radius_m_, mapper_rate_hz_, extract_on_depth_ ? 1 : 0,
         debug_semantic_all_traversable_ ? 1 : 0,
         layer_cake_path_.empty() ? "(unset)" : layer_cake_path_.c_str(),
-        publish_tsdf_color_mesh_ ? 1 : 0, tsdf_color_mesh_rate_hz_);
+        publish_tsdf_color_mesh_ ? 1 : 0, tsdf_color_mesh_rate_hz_,
+        publish_tsdf_voxels_ ? 1 : 0, tsdf_voxel_rate_hz_);
   }
 
   ~MappingNode() override
@@ -665,6 +669,8 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("color_weight_min", 0.001);
     // 0 = auto (2 × voxel_size). Vertical band when sampling ColorVoxel at elev.
     declare_parameter("color_z_search_half_band_m", 0.0);
+    // 0 → full BEV Z window above elev (min luminance in column).
+    declare_parameter("color_z_column_above_m", 0.0);
     // BEV: distance <= this counts as occupied (0 = classic TSDF ≤0).
     declare_parameter("bev_occ_tsdf_max_m", 0.0);
     declare_parameter("robot_height_m", 0.4);
@@ -717,6 +723,13 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("publish_tsdf_color_mesh", false);
     declare_parameter("tsdf_color_mesh_rate_hz", 1.0);
     declare_parameter("tsdf_color_mesh_max_triangles", 500000);
+    // Near-surface TSDF voxels as PointCloud2 (xyz+rgb from ColorLayer).
+    declare_parameter("publish_tsdf_voxels", false);
+    declare_parameter("tsdf_voxel_rate_hz", 1.0);
+    declare_parameter("tsdf_voxel_min_weight", 0.1);
+    // 0 → 2×voxel_size. Only |distance| ≤ this are emitted (surface shell).
+    declare_parameter("tsdf_voxel_max_distance_m", 0.0);
+    declare_parameter("tsdf_voxel_max_points", 400000);
     // Debug: publish nvblox spherical depth image from lidar pointcloud.
     declare_parameter("publish_lidar_depth_image", false);
     declare_parameter("publish_lidar_tsdf_probe", false);
@@ -767,6 +780,8 @@ class MappingNode : public rclcpp::Node {
         get_parameter("color_weight_min").as_double());
     color_z_search_half_band_m_ = static_cast<float>(
         get_parameter("color_z_search_half_band_m").as_double());
+    color_z_column_above_m_ = static_cast<float>(
+        get_parameter("color_z_column_above_m").as_double());
     bev_occ_tsdf_max_m_ = static_cast<float>(
         get_parameter("bev_occ_tsdf_max_m").as_double());
     robot_height_m_ = static_cast<float>(
@@ -837,6 +852,14 @@ class MappingNode : public rclcpp::Node {
         get_parameter("tsdf_color_mesh_rate_hz").as_double();
     tsdf_color_mesh_max_triangles_ =
         get_parameter("tsdf_color_mesh_max_triangles").as_int();
+    publish_tsdf_voxels_ = get_parameter("publish_tsdf_voxels").as_bool();
+    tsdf_voxel_rate_hz_ = get_parameter("tsdf_voxel_rate_hz").as_double();
+    tsdf_voxel_min_weight_ =
+        static_cast<float>(get_parameter("tsdf_voxel_min_weight").as_double());
+    tsdf_voxel_max_distance_m_ =
+        get_parameter("tsdf_voxel_max_distance_m").as_double();
+    tsdf_voxel_max_points_ =
+        get_parameter("tsdf_voxel_max_points").as_int();
     publish_lidar_depth_image_ =
         get_parameter("publish_lidar_depth_image").as_bool();
     publish_lidar_tsdf_probe_ =
@@ -1196,12 +1219,35 @@ class MappingNode : public rclcpp::Node {
     }
 
     for (auto& pc : pending_cams) {
-      if (!(pc.color_msg && pc.color_cam && use_color_)) {
+      if (!use_color_) {
+        RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Skip color integrate [%s]: use_color=false",
+            pc.slot ? pc.slot->name.c_str() : "?");
+        continue;
+      }
+      if (!pc.color_msg) {
+        RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Skip color integrate [%s]: no pending color image",
+            pc.slot ? pc.slot->name.c_str() : "?");
+        continue;
+      }
+      if (!pc.color_cam) {
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Skip color integrate [%s]: no color camera model "
+            "(missing/invalid camera_info)",
+            pc.slot ? pc.slot->name.c_str() : "?");
         continue;
       }
       const int64_t ns =
           rclcpp::Time(pc.color_msg->header.stamp).nanoseconds();
       if (ns == pc.slot->last_color_ns) {
+        RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Skip color integrate [%s]: duplicate color stamp",
+            pc.slot ? pc.slot->name.c_str() : "?");
         continue;
       }
       const auto t0 = Clock::now();
@@ -1228,9 +1274,17 @@ class MappingNode : public rclcpp::Node {
         } else {
           RCLCPP_WARN_THROTTLE(
               get_logger(), *get_clock(), 5000,
-              "Unsupported color encoding: %s",
+              "Skip color integrate [%s]: unsupported color encoding: %s",
+              pc.slot ? pc.slot->name.c_str() : "?",
               pc.color_msg->encoding.c_str());
         }
+      } else {
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "Skip color integrate [%s]: TF lookup failed %s <- %s @ %.3f",
+            pc.slot ? pc.slot->name.c_str() : "?",
+            global_frame_.c_str(), pc.color_msg->header.frame_id.c_str(),
+            rclcpp::Time(pc.color_msg->header.stamp).seconds());
       }
       integrate_ms +=
           std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -1280,6 +1334,7 @@ class MappingNode : public rclcpp::Node {
     pub_cv_.notify_one();
 
     maybePublishTsdfColorMesh(stamp);
+    maybePublishTsdfVoxels(stamp);
 
     const double loop1_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t_all)
@@ -1678,6 +1733,123 @@ class MappingNode : public rclcpp::Node {
     }
   }
 
+  void maybePublishTsdfVoxels(const rclcpp::Time& stamp)
+  {
+    if (!publish_tsdf_voxels_) {
+      return;
+    }
+    if (!rateOk(&last_tsdf_voxels_, tsdf_voxel_rate_hz_, stamp)) {
+      return;
+    }
+    if (tsdf_voxels_pub_->get_subscription_count() == 0) {
+      return;
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+
+    const nvblox::TsdfLayer& tsdf = mapper_->mapper().tsdf_layer();
+    const nvblox::ColorLayer& color = mapper_->mapper().color_layer();
+    const float block_size = tsdf.block_size();
+    const float voxel_size = tsdf.voxel_size();
+    const float max_abs_d =
+        tsdf_voxel_max_distance_m_ > 0.0
+            ? static_cast<float>(tsdf_voxel_max_distance_m_)
+            : (2.f * voxel_size);
+    const size_t max_pts = static_cast<size_t>(
+        std::max(1, tsdf_voxel_max_points_));
+
+    // ColorLayer is usually device memory; clone blocks once for host lookup.
+    nvblox::Index3DHashMapType<nvblox::ColorBlock::ConstPtr>::type color_host;
+    const bool clone_color =
+        (color.memory_type() == nvblox::MemoryType::kDevice);
+    for (const nvblox::Index3D& bi : color.getAllBlockIndices()) {
+      nvblox::ColorBlock::ConstPtr blk = color.getBlockAtIndex(bi);
+      if (!blk) {
+        continue;
+      }
+      color_host.emplace(
+          bi, clone_color ? blk.clone(nvblox::MemoryType::kHost) : blk);
+    }
+
+    std::vector<nvblox::Vector3f> pts;
+    std::vector<uint32_t> packed_rgb;
+    pts.reserve(std::min(max_pts, size_t{65536}));
+    packed_rgb.reserve(std::min(max_pts, size_t{65536}));
+
+    size_t n_geom = 0;
+    size_t n_colored = 0;
+    size_t n_trunc = 0;
+    nvblox::callFunctionOnAllVoxels<nvblox::TsdfVoxel>(
+        tsdf,
+        [&](const nvblox::Index3D& bi, const nvblox::Index3D& vi,
+            const nvblox::TsdfVoxel* vox) {
+          if (pts.size() >= max_pts) {
+            ++n_trunc;
+            return;
+          }
+          if (vox->weight < tsdf_voxel_min_weight_) {
+            return;
+          }
+          if (std::fabs(vox->distance) > max_abs_d) {
+            return;
+          }
+          ++n_geom;
+          pts.push_back(nvblox::getCenterPositionFromBlockIndexAndVoxelIndex(
+              block_size, bi, vi));
+
+          // Magenta = TSDF surface with no ColorVoxel weight (integration miss).
+          uint8_t r = 255, g = 0, b = 255;
+          const auto it = color_host.find(bi);
+          if (it != color_host.end() && it->second) {
+            const nvblox::ColorVoxel& cv =
+                it->second->voxels[vi.x()][vi.y()][vi.z()];
+            if (cv.weight > 1e-4f) {
+              r = cv.color.r();
+              g = cv.color.g();
+              b = cv.color.b();
+              ++n_colored;
+            }
+          }
+          packed_rgb.push_back(
+              (static_cast<uint32_t>(r) << 16) |
+              (static_cast<uint32_t>(g) << 8) |
+              static_cast<uint32_t>(b));
+        });
+
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.stamp = stamp;
+    cloud.header.frame_id = global_frame_;
+    cloud.height = 1;
+    cloud.width = static_cast<uint32_t>(pts.size());
+    cloud.is_dense = true;
+    cloud.is_bigendian = false;
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2FieldsByString(2, "xyz", "rgb");
+    mod.resize(pts.size());
+    sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<float> iter_rgb(cloud, "rgb");
+    for (size_t i = 0; i < pts.size();
+         ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_rgb) {
+      *iter_x = pts[i].x();
+      *iter_y = pts[i].y();
+      *iter_z = pts[i].z();
+      std::memcpy(&(*iter_rgb), &packed_rgb[i], sizeof(float));
+    }
+    tsdf_voxels_pub_->publish(cloud);
+
+    const double ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "tsdf_voxels: pts=%zu colored=%zu geom=%zu trunc_extra=%zu "
+        "color_blocks=%zu |d|<=%.3f in %.1fms → ~/tsdf_voxels",
+        pts.size(), n_colored, n_geom, n_trunc, color_host.size(), max_abs_d,
+        ms);
+  }
+
   void maybePublishTsdfColorMesh(const rclcpp::Time& stamp)
   {
     if (!publish_tsdf_color_mesh_) {
@@ -1970,6 +2142,7 @@ class MappingNode : public rclcpp::Node {
   float unobserved_luminance_{128.f};
   float color_weight_min_{1e-3f};
   float color_z_search_half_band_m_{0.f};
+  float color_z_column_above_m_{0.f};
   float bev_occ_tsdf_max_m_{0.f};
   float robot_height_m_{0.4f};
   float elev_z_min_rel_{-1.f};
@@ -2007,6 +2180,11 @@ class MappingNode : public rclcpp::Node {
   bool publish_tsdf_color_mesh_{false};
   double tsdf_color_mesh_rate_hz_{1.0};
   int tsdf_color_mesh_max_triangles_{500000};
+  bool publish_tsdf_voxels_{false};
+  double tsdf_voxel_rate_hz_{1.0};
+  float tsdf_voxel_min_weight_{0.1f};
+  double tsdf_voxel_max_distance_m_{0.0};
+  int tsdf_voxel_max_points_{400000};
   bool publish_lidar_depth_image_{false};
   bool publish_lidar_tsdf_probe_{false};
   int lidar_tsdf_probe_max_points_{4000};
@@ -2048,6 +2226,8 @@ class MappingNode : public rclcpp::Node {
       lidar_depth_cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
       lidar_tsdf_probe_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+      tsdf_voxels_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
       extract_timing_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_srv_;
@@ -2059,6 +2239,7 @@ class MappingNode : public rclcpp::Node {
   rclcpp::Time last_lidar_integrate_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_clear_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_tsdf_color_mesh_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_tsdf_voxels_{0, 0, RCL_ROS_TIME};
 
   std::thread worker_thread_;
   std::mutex wake_mutex_;

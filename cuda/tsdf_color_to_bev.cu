@@ -56,13 +56,62 @@ __device__ inline bool test_bit(
   return (words[cell * n_words + w] >> (iz & 31)) & 1u;
 }
 
+__device__ inline float colorLuminance(const nvblox::Color& c) {
+  return 0.299f * static_cast<float>(c.r()) +
+         0.587f * static_cast<float>(c.g()) +
+         0.114f * static_cast<float>(c.b());
+}
+
+/// Match nvblox ColorMeshIntegrator::updateAppearance: closest ColorVoxel
+/// with weight (3×3×3 around the query point). Same-index TSDF voxels are
+/// often unpainted; color lives on the free-side neighbor.
+__device__ inline bool closestColorLuminance(
+    nvblox::Index3DDeviceHashMapType<nvblox::ColorBlock> color_hash,
+    float block_size, float voxel_size, const nvblox::Vector3f& p,
+    float color_weight_min, float* out_L)
+{
+  float best_d2 = kInf;
+  float best_L = 0.f;
+  bool found = false;
+  for (int dx = -1; dx <= 1; ++dx) {
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dz = -1; dz <= 1; ++dz) {
+        const nvblox::Vector3f q =
+            p + nvblox::Vector3f(
+                    static_cast<float>(dx) * voxel_size,
+                    static_cast<float>(dy) * voxel_size,
+                    static_cast<float>(dz) * voxel_size);
+        nvblox::ColorVoxel* cv = nullptr;
+        if (!nvblox::getVoxelAtPosition<nvblox::ColorVoxel>(
+                color_hash, q, block_size, &cv) ||
+            cv == nullptr || cv->weight < color_weight_min) {
+          continue;
+        }
+        const nvblox::Vector3f d = q - p;
+        const float d2 = d.x() * d.x() + d.y() * d.y() + d.z() * d.z();
+        if (d2 < best_d2) {
+          best_d2 = d2;
+          best_L = colorLuminance(cv->color);
+          found = true;
+        }
+      }
+    }
+  }
+  if (found) {
+    *out_L = best_L;
+  }
+  return found;
+}
+
 __global__ void scatter_block_voxels_kernel(
     nvblox::Index3DDeviceHashMapType<nvblox::TsdfBlock> tsdf_hash,
+    nvblox::Index3DDeviceHashMapType<nvblox::ColorBlock> color_hash,
     const nvblox::Index3D* blocks, int n_blocks, float block_size,
     float origin_x, float origin_y, float resolution, int width, int height,
     float z_min, float z_max, float step, int nz, float tsdf_weight_min,
-    float bev_occ_tsdf_max_m, int n_words, uint32_t* occ_bits,
-    uint32_t* free_bits) {
+    float bev_occ_tsdf_max_m, float color_weight_min, float color_band_m,
+    float voxel_size, int n_words, uint32_t* occ_bits, uint32_t* free_bits,
+    uint32_t* lum_iz_u) {
   const int b = static_cast<int>(blockIdx.x);
   if (b >= n_blocks) {
     return;
@@ -113,64 +162,28 @@ __global__ void scatter_block_voxels_kernel(
   } else {
     set_bit(occ_bits, n_words, cell, iz);
   }
-}
 
-__device__ inline float colorLuminance(const nvblox::Color& c) {
-  return 0.299f * static_cast<float>(c.r()) +
-         0.587f * static_cast<float>(c.g()) +
-         0.114f * static_cast<float>(c.b());
-}
-
-/// Nearest ColorVoxel in a vertical band around surface_z (highest weight,
-/// then closest Z). Projective color lives in the truncation band; elev Z
-/// from lidar free/occ bits often misses the exact painted voxel.
-__device__ inline bool sampleColorNearSurface(
-    nvblox::Index3DDeviceHashMapType<nvblox::ColorBlock> color_hash,
-    float block_size, float x, float y, float surface_z, float step,
-    float half_band_m, float color_weight_min, float* out_L)
-{
-  const float half = fmaxf(half_band_m, step);
-  const int n_steps =
-      static_cast<int>(ceilf(half / fmaxf(step, 1e-4f)));
-  float best_w = -1.f;
-  float best_dz = kInf;
-  float best_L = 0.f;
-  bool found = false;
-
-  for (int k = -n_steps; k <= n_steps; ++k) {
-    const float z = surface_z + static_cast<float>(k) * step;
-    nvblox::ColorVoxel* cv = nullptr;
-    if (!nvblox::getVoxelAtPosition<nvblox::ColorVoxel>(
-            color_hash, nvblox::Vector3f(x, y, z), block_size, &cv) ||
-        cv == nullptr || cv->weight < color_weight_min) {
-      continue;
-    }
-    const float w = cv->weight;
-    const float dz = fabsf(z - surface_z);
-    if (w > best_w + 1e-6f ||
-        (fabsf(w - best_w) <= 1e-6f && dz < best_dz)) {
-      best_w = w;
-      best_dz = dz;
-      best_L = colorLuminance(cv->color);
-      found = true;
+  // Color into this XY cell's Z bin — read back only if this iz becomes floor.
+  if (lum_iz_u != nullptr && fabsf(voxel.distance) <= color_band_m) {
+    float sampled_L = 0.f;
+    if (closestColorLuminance(
+            color_hash, block_size, voxel_size, p, color_weight_min,
+            &sampled_L)) {
+      const uint32_t L = static_cast<uint32_t>(
+          fminf(fmaxf(sampled_L, 0.f), 255.f) + 0.5f);
+      atomicMin(&lum_iz_u[cell * nz + iz], L);
     }
   }
-  if (found) {
-    *out_L = best_L;
-  }
-  return found;
 }
 
 __global__ void finalize_from_bits_kernel(
     nvblox::Index3DDeviceHashMapType<nvblox::TsdfBlock> tsdf_hash,
-    nvblox::Index3DDeviceHashMapType<nvblox::ColorBlock> color_hash,
     float block_size, float origin_x, float origin_y, float resolution,
     int width, int height, float z_max, float step, int nz, float unknown_elev_z,
     float robot_height_m, float tsdf_weight_min, float bev_occ_tsdf_max_m,
-    float unobserved_luminance, float color_weight_min,
-    float color_z_search_half_band_m, int n_words,
-    const uint32_t* occ_bits, const uint32_t* free_bits, float* elev, float* lum,
-    float* cost, uint8_t* observed, const float* prior_elev,
+    float unobserved_luminance, int n_words, const uint32_t* occ_bits,
+    const uint32_t* free_bits, const uint32_t* lum_iz_u, float* elev,
+    float* lum, float* cost, uint8_t* observed, const float* prior_elev,
     const float* prior_cost, const uint8_t* prior_obs, float prior_ox,
     float prior_oy, float prior_res, int prior_w, int prior_h, float prior_tx,
     float prior_ty, float prior_tz, float prior_yaw, bool prior_enabled) {
@@ -184,6 +197,7 @@ __global__ void finalize_from_bits_kernel(
   float ceiling_z = kInf;
   float surface_z = unknown_elev_z;
   bool found = false;
+  int floor_iz = -1;
 
   for (int iz = 0; iz < nz; ++iz) {
     if (!test_bit(occ_bits, n_words, cell, iz)) {
@@ -223,6 +237,7 @@ __global__ void finalize_from_bits_kernel(
         isfinite(ceiling_z) ? (ceiling_z - z_hit) : kInf;
     if (clearance >= h_req) {
       surface_z = z_hit;
+      floor_iz = iz;
       found = true;
       break;
     }
@@ -238,13 +253,16 @@ __global__ void finalize_from_bits_kernel(
   if (found) {
     out_elev = surface_z;
     out_obs = 255;
-    const float x = origin_x + (static_cast<float>(ix) + 0.5f) * resolution;
-    const float y = origin_y + (static_cast<float>(iy) + 0.5f) * resolution;
-    float sampled_L = unobserved_luminance;
-    if (sampleColorNearSurface(
-            color_hash, block_size, x, y, surface_z, step,
-            color_z_search_half_band_m, color_weight_min, &sampled_L)) {
-      L = sampled_L;
+    // Color of the floor bin (and free-side bin just above, where mesh color
+    // usually lives). Not the whole column — that mixed ceilings/people/floor.
+    if (lum_iz_u != nullptr && floor_iz >= 0) {
+      uint32_t Lcode = lum_iz_u[cell * nz + floor_iz];
+      if (floor_iz > 0) {
+        Lcode = min(Lcode, lum_iz_u[cell * nz + (floor_iz - 1)]);
+      }
+      if (Lcode <= 255u) {
+        L = static_cast<float>(Lcode);
+      }
     }
     out_cost = L;
   } else if (
@@ -381,6 +399,9 @@ TsdfColorToBevWorkspace::~TsdfColorToBevWorkspace() {
   if (obs_d) {
     cudaFree(obs_d);
   }
+  if (lum_iz_u_d) {
+    cudaFree(lum_iz_u_d);
+  }
   if (occ_bits_d) {
     cudaFree(occ_bits_d);
   }
@@ -395,7 +416,8 @@ TsdfColorToBevWorkspace::~TsdfColorToBevWorkspace() {
 void TsdfColorToBevWorkspace::ensureCells(int cells, int nz) {
   const int words = std::max(1, (nz + 31) / 32);
   const bool need_cells = cells > cell_capacity;
-  const bool need_bits = need_cells || words > bit_words;
+  const bool need_nz = nz > nz_capacity;
+  const bool need_bits = need_cells || words > bit_words || need_nz;
   if (!need_bits && !need_cells) {
     bit_words = words;
     return;
@@ -431,6 +453,21 @@ void TsdfColorToBevWorkspace::ensureCells(int cells, int nz) {
     checkCuda(cudaMalloc(&normal_d, nbytes_n), "cudaMalloc normal");
     checkCuda(cudaMalloc(&obs_d, nbytes_u), "cudaMalloc observed");
     cell_capacity = cells;
+  }
+
+  if (need_cells || need_nz) {
+    if (lum_iz_u_d) {
+      cudaFree(lum_iz_u_d);
+      lum_iz_u_d = nullptr;
+    }
+    const int nz_alloc = std::max(nz, nz_capacity);
+    checkCuda(
+        cudaMalloc(
+            &lum_iz_u_d,
+            static_cast<size_t>(cell_capacity) * static_cast<size_t>(nz_alloc) *
+                sizeof(uint32_t)),
+        "cudaMalloc lum_iz_u");
+    nz_capacity = nz_alloc;
   }
 
   if (occ_bits_d) {
@@ -492,6 +529,12 @@ void tsdf_color_to_bev(
   checkCuda(
       cudaMemsetAsync(workspace->free_bits_d, 0, nbytes_bits, cuda_stream),
       "memset free_bits");
+  checkCuda(
+      cudaMemsetAsync(
+          workspace->lum_iz_u_d, 0xFF,
+          static_cast<size_t>(n) * static_cast<size_t>(nz) * sizeof(uint32_t),
+          cuda_stream),
+      "memset lum_iz_u");
   // Costmap default = unobserved_luminance (SSoT); finalize overwrites cells.
   {
     const float fill = params.unobserved_luminance;
@@ -527,20 +570,18 @@ void tsdf_color_to_bev(
             cuda_stream),
         "H2D block_indices");
 
+    const float color_band = fmaxf(4.f * voxel_size, params.color_z_search_half_band_m);
     scatter_block_voxels_kernel<<<static_cast<int>(blocks.size()),
                                   kVoxelsPerBlock, 0, cuda_stream>>>(
-        tsdf_hash, workspace->block_indices_d, static_cast<int>(blocks.size()),
-        block_size, params.origin_x, params.origin_y, params.resolution,
-        params.width, params.height, params.z_min, params.z_max, step, nz,
-        params.tsdf_weight_min, params.bev_occ_tsdf_max_m, n_words,
-        workspace->occ_bits_d, workspace->free_bits_d);
+        tsdf_hash, color_hash, workspace->block_indices_d,
+        static_cast<int>(blocks.size()), block_size, params.origin_x,
+        params.origin_y, params.resolution, params.width, params.height,
+        params.z_min, params.z_max, step, nz, params.tsdf_weight_min,
+        params.bev_occ_tsdf_max_m, params.color_weight_min, color_band,
+        voxel_size, n_words, workspace->occ_bits_d, workspace->free_bits_d,
+        workspace->lum_iz_u_d);
     checkCuda(cudaGetLastError(), "scatter_block_voxels_kernel");
   }
-
-  const float color_half_band =
-      (params.color_z_search_half_band_m > 0.f)
-          ? params.color_z_search_half_band_m
-          : (2.f * voxel_size);
 
   const bool prior_ok =
       prior && prior->enabled && prior->elev_d && prior->cost_d &&
@@ -549,13 +590,12 @@ void tsdf_color_to_bev(
   dim3 b2(
       (params.width + t2.x - 1) / t2.x, (params.height + t2.y - 1) / t2.y);
   finalize_from_bits_kernel<<<b2, t2, 0, cuda_stream>>>(
-      tsdf_hash, color_hash, block_size, params.origin_x, params.origin_y,
+      tsdf_hash, block_size, params.origin_x, params.origin_y,
       params.resolution, params.width, params.height, params.z_max, step, nz,
       params.unknown_elev_z, params.robot_height_m, params.tsdf_weight_min,
-      params.bev_occ_tsdf_max_m, params.unobserved_luminance,
-      params.color_weight_min, color_half_band, n_words, workspace->occ_bits_d,
-      workspace->free_bits_d, workspace->elev_d, workspace->lum_d,
-      workspace->cost_d, workspace->obs_d,
+      params.bev_occ_tsdf_max_m, params.unobserved_luminance, n_words,
+      workspace->occ_bits_d, workspace->free_bits_d, workspace->lum_iz_u_d,
+      workspace->elev_d, workspace->lum_d, workspace->cost_d, workspace->obs_d,
       prior_ok ? prior->elev_d : nullptr,
       prior_ok ? prior->cost_d : nullptr,
       prior_ok ? prior->obs_d : nullptr,

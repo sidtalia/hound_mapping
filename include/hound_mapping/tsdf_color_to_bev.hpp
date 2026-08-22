@@ -32,9 +32,12 @@ struct TsdfColorToBevParams {
   /// ``unobserved_luminance``). Typical: 128 = unknown gray, 255 = treat as free.
   float unobserved_luminance = 128.f;
   float color_weight_min = 1e-3f;
-  /// Vertical half-band (m) around elev floor when sampling ColorVoxel.
-  /// 0 → auto (2 × TSDF voxel size). Fixes grey holes from Z mismatch.
+  /// Vertical half-band (m) below elev floor when sampling ColorVoxel.
+  /// 0 → auto (2 × TSDF voxel size).
   float color_z_search_half_band_m = 0.f;
+  /// Search this far above elev for darker (lethal) color in the column.
+  /// 0 → full BEV Z span (z_max - z_min). People/walls paint above the floor.
+  float color_z_column_above_m = 0.f;
   /// Unused in tsdf_color_to_bev; passed through for callers that also slope.
   float lethal_slope_deg = 60.f;
 };
@@ -59,10 +62,14 @@ class TsdfColorToBevWorkspace {
   /// Per-cell Z occupancy / free bitsets (n_words = ceil(nz/32) each).
   uint32_t* occ_bits_d = nullptr;
   uint32_t* free_bits_d = nullptr;
+  /// Per-cell, per-Z-bin min luminance (0–255). 0xFFFFFFFF = no color in bin.
+  /// Indexed [cell * nz + iz]. Used when that iz is chosen as the floor.
+  uint32_t* lum_iz_u_d = nullptr;
   nvblox::Index3D* block_indices_d = nullptr;
 
   int cell_capacity = 0;
   int bit_words = 0;
+  int nz_capacity = 0;
   int block_capacity = 0;
 };
 
