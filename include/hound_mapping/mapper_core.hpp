@@ -41,6 +41,9 @@ class MapperCore {
 
   void clearOutsideRadius(const nvblox::Vector3f& center_L);
 
+  /// Drop all TSDF/color blocks (new empty mapper, same voxel/integrator config).
+  void clear();
+
   /// Serialize TSDF/color LayerCake to an nvblox SQLite map file.
   /// Must be called from the thread that owns the mapper (no concurrent integrate).
   bool saveLayerCake(const std::string& path) const;

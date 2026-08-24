@@ -62,6 +62,18 @@ void MapperCore::clearOutsideRadius(const nvblox::Vector3f& center_L)
   }
 }
 
+void MapperCore::clear()
+{
+  nvblox::BlockMemoryPoolParams pool_params(nvblox::MemoryType::kDevice);
+  mapper_ = std::make_unique<nvblox::Mapper>(
+      config_.voxel_size_m, pool_params, nvblox::ProjectiveLayerType::kTsdf,
+      cuda_stream_);
+  mapper_->tsdf_integrator().max_integration_distance_m(
+      config_.max_integration_distance_m);
+  mapper_->lidar_tsdf_integrator().max_integration_distance_m(
+      config_.lidar_max_integration_distance_m);
+}
+
 bool MapperCore::saveLayerCake(const std::string& path) const
 {
   return mapper_->saveLayerCake(path);

@@ -18,12 +18,12 @@
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/map_meta_data.hpp>
-#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -324,39 +324,6 @@ sensor_msgs::msg::Image matToImageMsg(
   return msg;
 }
 
-/// LocalMap cost [0,255] free-ness → OccupancyGrid (0 free .. 100 lethal).
-/// Unobserved is encoded in cost (SSoT unobserved_luminance, e.g. 128), not a
-/// separate mask — mid values map to mid occupancy.
-nav_msgs::msg::OccupancyGrid costToOccupancyGrid(
-    const cv::Mat& cost, const std_msgs::msg::Header& header, float resolution,
-    float origin_x, float origin_y, float origin_z)
-{
-  nav_msgs::msg::OccupancyGrid grid;
-  grid.header = header;
-  grid.info.map_load_time = header.stamp;
-  grid.info.resolution = resolution;
-  grid.info.width = static_cast<uint32_t>(cost.cols);
-  grid.info.height = static_cast<uint32_t>(cost.rows);
-  grid.info.origin.position.x = origin_x;
-  grid.info.origin.position.y = origin_y;
-  grid.info.origin.position.z = origin_z;
-  grid.info.origin.orientation.w = 1.0;
-
-  const int cells = cost.rows * cost.cols;
-  grid.data.resize(static_cast<size_t>(cells));
-  for (int r = 0; r < cost.rows; ++r) {
-    const float* crow = cost.ptr<float>(r);
-    for (int c = 0; c < cost.cols; ++c) {
-      const size_t i = static_cast<size_t>(r) * static_cast<size_t>(cost.cols) +
-                       static_cast<size_t>(c);
-      const float free_l = std::clamp(crow[c], 0.f, 255.f);
-      const float lethal = 1.f - free_l / 255.f;
-      grid.data[i] = static_cast<int8_t>(std::lround(lethal * 100.f));
-    }
-  }
-  return grid;
-}
-
 }  // namespace
 
 /// Single worker thread drains latest sensor slots at mapper_rate_hz:
@@ -399,6 +366,7 @@ class MappingNode : public rclcpp::Node {
     ec.do_inpaint = do_inpaint_;
     ec.inpaint_resolution_m = inpaint_resolution_m_;
     ec.inpaint_radius = inpaint_radius_;
+    ec.elev_median_ksize = elev_median_ksize_;
     extractor_ = std::make_unique<ElevationCostExtractor>(ec);
     // Separate CUDA workspace for loop2 (inpaint/slope) so it never races loop1 BEV.
     finish_extractor_ = std::make_unique<ElevationCostExtractor>(ec);
@@ -431,12 +399,11 @@ class MappingNode : public rclcpp::Node {
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // Latest-only: nav + RViz only need the newest LocalMap.
+    // Latest-only, best-effort: extra readers (RViz, ros2 topic hz) must not
+    // stall the mapper with reliable backpressure.
     local_map_pub_ =
         create_publisher<hound_mapping::msg::LocalMap>(
-            "~/local_map", rclcpp::QoS(1).reliable());
-    costmap_pub_ =
-        create_publisher<nav_msgs::msg::OccupancyGrid>("~/costmap", 1);
+            "~/local_map", rclcpp::QoS(1).best_effort());
     tsdf_color_cloud_pub_ =
         create_publisher<sensor_msgs::msg::PointCloud2>("~/tsdf_color_cloud", 1);
     tsdf_color_mesh_pub_ =
@@ -479,9 +446,7 @@ class MappingNode : public rclcpp::Node {
                 std::lock_guard<std::mutex> lock(slot->mu);
                 slot->pending_depth = msg;
               }
-              if (extract_on_depth_) {
-                requestDrainSoon();
-              }
+              requestDrainSoon();
             });
       }
       if (use_color_) {
@@ -494,9 +459,17 @@ class MappingNode : public rclcpp::Node {
             });
         slot->color_sub = create_subscription<sensor_msgs::msg::Image>(
             color_topic, sensor_qos,
-            [slot](sensor_msgs::msg::Image::ConstSharedPtr msg) {
-              std::lock_guard<std::mutex> lock(slot->mu);
-              slot->pending_color = msg;
+            [this, slot](sensor_msgs::msg::Image::ConstSharedPtr msg) {
+              RCLCPP_INFO_ONCE(
+                  get_logger(),
+                  "first color on %s (%s)",
+                  slot->name.c_str(),
+                  msg->header.frame_id.c_str());
+              {
+                std::lock_guard<std::mutex> lock(slot->mu);
+                slot->pending_color = msg;
+              }
+              requestDrainSoon();
             });
       }
       cam_slots_.push_back(slot);
@@ -542,8 +515,16 @@ class MappingNode : public rclcpp::Node {
       lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
           lidar_topic_, sensor_qos,
           [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-            std::lock_guard<std::mutex> lock(inbox_mutex_);
-            pending_lidar_ = msg;
+            RCLCPP_INFO_ONCE(
+                get_logger(),
+                "first lidar on %s frame=%s",
+                lidar_topic_.c_str(),
+                msg->header.frame_id.c_str());
+            {
+              std::lock_guard<std::mutex> lock(inbox_mutex_);
+              pending_lidar_ = msg;
+            }
+            requestDrainSoon();
           });
     }
     if (use_people_mask_) {
@@ -554,6 +535,17 @@ class MappingNode : public rclcpp::Node {
             pending_mask_ = msg;
           });
     }
+
+    map_clear_sub_ = create_subscription<std_msgs::msg::Empty>(
+        map_clear_topic_, 1,
+        [this](const std_msgs::msg::Empty::SharedPtr) {
+          {
+            std::lock_guard<std::mutex> lock(wake_mutex_);
+            clear_requested_ = true;
+            drain_soon_ = true;
+          }
+          wake_cv_.notify_one();
+        });
 
     save_srv_ = create_service<std_srvs::srv::Trigger>(
         "~/save_layer_cake",
@@ -584,18 +576,20 @@ class MappingNode : public rclcpp::Node {
     RCLCPP_INFO(
         get_logger(),
         "hound_mapping ready: depth=%d color=%d lidar=%d voxel=%.3f "
-        "local_map=%.1fm clear_r=%.1fm loop1=integrate+BEV@%.1fHz "
+        "local_map=%.1fm clear_r=%.1fm loop1=integrate+BEV on new data "
         "loop2=inpaint/publish extract_on_depth=%d "
         "debug_semantic_all_traversable=%d "
         "save_layer_cake=~/save_layer_cake path=%s "
+        "map_clear=%s "
         "tsdf_color_mesh=%d@%.1fHz tsdf_voxels=%d@%.1fHz "
-        "(~/local_map + ~/costmap + ~/tsdf_color_cloud|mesh|~/tsdf_voxels)",
+        "(~/local_map + ~/tsdf_color_cloud|mesh|~/tsdf_voxels)",
         use_depth_, use_color_, use_lidar_, voxel_size_,
         local_map_size_m_ > 0.f ? local_map_size_m_
                                 : (2.f * map_clearing_radius_m_),
-        map_clearing_radius_m_, mapper_rate_hz_, extract_on_depth_ ? 1 : 0,
+        map_clearing_radius_m_, extract_on_depth_ ? 1 : 0,
         debug_semantic_all_traversable_ ? 1 : 0,
         layer_cake_path_.empty() ? "(unset)" : layer_cake_path_.c_str(),
+        map_clear_topic_.c_str(),
         publish_tsdf_color_mesh_ ? 1 : 0, tsdf_color_mesh_rate_hz_,
         publish_tsdf_voxels_ ? 1 : 0, tsdf_voxel_rate_hz_);
   }
@@ -648,6 +642,7 @@ class MappingNode : public rclcpp::Node {
     double integrate_ms{0.0};
     double bev_ms{0.0};
     double handoff_ms{0.0};
+    double loop1_ms{0.0};
   };
 
   void declareParams()
@@ -657,6 +652,8 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("voxel_size", 0.05);
     declare_parameter("elevation_resolution", 0.05);
     declare_parameter("map_clearing_radius_m", 32.0);
+    // Empty TSDF (worker thread). Same pattern as FCU ~/ekf_reset.
+    declare_parameter("map_clear_topic", "~/map_clear");
     // Full LocalMap side length (m). <=0 → 2 * map_clearing_radius_m.
     declare_parameter("local_map_size_m", 0.0);
     declare_parameter("max_integration_distance_m", 15.0);
@@ -665,6 +662,7 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("do_inpaint", true);
     declare_parameter("inpaint_resolution_m", 0.25);
     declare_parameter("inpaint_radius", 3);
+    declare_parameter("elev_median_ksize", 5);
     declare_parameter("unobserved_luminance", 128.0);
     declare_parameter("color_weight_min", 0.001);
     // 0 = auto (2 × voxel_size). Vertical band when sampling ColorVoxel at elev.
@@ -709,7 +707,7 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("lidar_min_valid_range_m", 0.3);
     declare_parameter("use_lidar_motion_compensation", false);
 
-    // Single worker tick rate (integrate latest + BEV + inpaint + publish).
+    // Legacy: worker is event-driven on new depth/color/lidar (latest-only).
     declare_parameter("mapper_rate_hz", 20.0);
     // Legacy alias: if mapper_rate_hz unset in older launch, still honored via
     // loadParams fallback when publish_map_rate_hz is the only rate set.
@@ -718,7 +716,7 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("integrate_color_rate_hz", 20.0);
     declare_parameter("integrate_lidar_rate_hz", 10.0);
     declare_parameter("map_clear_rate_hz", 20.0);
-    declare_parameter("log_extract_timing", true);
+    declare_parameter("log_extract_timing", false);
     // Debug: publish colored TSDF isosurface (mesh vertices / triangles).
     declare_parameter("publish_tsdf_color_mesh", false);
     declare_parameter("tsdf_color_mesh_rate_hz", 1.0);
@@ -762,6 +760,7 @@ class MappingNode : public rclcpp::Node {
         static_cast<float>(get_parameter("elevation_resolution").as_double());
     map_clearing_radius_m_ = static_cast<float>(
         get_parameter("map_clearing_radius_m").as_double());
+    map_clear_topic_ = get_parameter("map_clear_topic").as_string();
     local_map_size_m_ = static_cast<float>(
         get_parameter("local_map_size_m").as_double());
     max_integration_distance_m_ = static_cast<float>(
@@ -774,6 +773,8 @@ class MappingNode : public rclcpp::Node {
     inpaint_resolution_m_ = static_cast<float>(
         get_parameter("inpaint_resolution_m").as_double());
     inpaint_radius_ = static_cast<int>(get_parameter("inpaint_radius").as_int());
+    elev_median_ksize_ =
+        static_cast<int>(get_parameter("elev_median_ksize").as_int());
     unobserved_luminance_ = static_cast<float>(
         get_parameter("unobserved_luminance").as_double());
     color_weight_min_ = static_cast<float>(
@@ -844,6 +845,7 @@ class MappingNode : public rclcpp::Node {
         get_parameter("integrate_lidar_rate_hz").as_double();
     (void)integrate_depth_rate_hz_;
     (void)integrate_color_rate_hz_;
+    (void)integrate_lidar_rate_hz_;
     map_clear_rate_hz_ = get_parameter("map_clear_rate_hz").as_double();
     log_extract_timing_ = get_parameter("log_extract_timing").as_bool();
     publish_tsdf_color_mesh_ =
@@ -1036,27 +1038,15 @@ class MappingNode : public rclcpp::Node {
 
   void workerLoop()
   {
-    using Clock = std::chrono::steady_clock;
-    const auto period = std::chrono::duration<double>(
-        1.0 / std::max(mapper_rate_hz_, 1.0));
     while (true) {
       {
         std::unique_lock<std::mutex> lock(wake_mutex_);
         if (!worker_running_) {
           return;
         }
-        if (extract_on_depth_) {
-          wake_cv_.wait(lock, [this]() {
-            return drain_soon_ || !worker_running_;
-          });
-        } else {
-          const auto deadline =
-              Clock::now() +
-              std::chrono::duration_cast<Clock::duration>(period);
-          wake_cv_.wait_until(lock, deadline, [this]() {
-            return drain_soon_ || !worker_running_;
-          });
-        }
+        wake_cv_.wait(lock, [this]() {
+          return drain_soon_ || !worker_running_;
+        });
         drain_soon_ = false;
         if (!worker_running_) {
           return;
@@ -1070,6 +1060,7 @@ class MappingNode : public rclcpp::Node {
   {
     using Clock = std::chrono::steady_clock;
     maybeSaveLayerCake();
+    const bool map_cleared = maybeClearMap();
 
     const auto t_all = Clock::now();
 
@@ -1154,68 +1145,64 @@ class MappingNode : public rclcpp::Node {
     }
 
     if (lidar_msg && use_lidar_) {
-      if (rateOk(
-              &last_lidar_integrate_, integrate_lidar_rate_hz_,
-              lidar_msg->header.stamp)) {
-        const auto t0 = Clock::now();
-        nvblox::Transform T_L_S;
-        if (lookupTf(
-                global_frame_, lidar_msg->header.frame_id,
-                lidar_msg->header.stamp, &T_L_S)) {
-          nvblox::Pointcloud cloud(nvblox::MemoryType::kDevice);
-          nvblox::Time scan_duration_ms(0);
-          if (cloudToNvblox(
-                  *lidar_msg, &cloud, lidar_stream_, &scan_duration_ms)) {
-            bool do_mc = use_lidar_motion_compensation_;
-            std::optional<nvblox::Transform> T_end;
-            std::optional<nvblox::Time> duration;
-            if (do_mc) {
-              if (static_cast<int64_t>(scan_duration_ms) <= 0 ||
-                  !cloud.timestamps_ms().has_value()) {
-                RCLCPP_WARN_THROTTLE(
-                    get_logger(), *get_clock(), 10000,
-                    "Lidar MC requested but pointcloud has no usable "
-                    "per-point times; integrating without MC");
-                do_mc = false;
+      const auto t0 = Clock::now();
+      nvblox::Transform T_L_S;
+      if (lookupTf(
+              global_frame_, lidar_msg->header.frame_id,
+              lidar_msg->header.stamp, &T_L_S)) {
+        nvblox::Pointcloud cloud(nvblox::MemoryType::kDevice);
+        nvblox::Time scan_duration_ms(0);
+        if (cloudToNvblox(
+                *lidar_msg, &cloud, lidar_stream_, &scan_duration_ms)) {
+          bool do_mc = use_lidar_motion_compensation_;
+          std::optional<nvblox::Transform> T_end;
+          std::optional<nvblox::Time> duration;
+          if (do_mc) {
+            if (static_cast<int64_t>(scan_duration_ms) <= 0 ||
+                !cloud.timestamps_ms().has_value()) {
+              RCLCPP_WARN_THROTTLE(
+                  get_logger(), *get_clock(), 10000,
+                  "Lidar MC requested but pointcloud has no usable "
+                  "per-point times; integrating without MC");
+              do_mc = false;
+            } else {
+              constexpr int64_t kMsToNs = 1000000;
+              const int64_t start_ns =
+                  rclcpp::Time(lidar_msg->header.stamp).nanoseconds();
+              const rclcpp::Time scan_end(
+                  start_ns +
+                  static_cast<int64_t>(scan_duration_ms) * kMsToNs);
+              nvblox::Transform T_L_S_end;
+              if (lookupTf(
+                      global_frame_, lidar_msg->header.frame_id, scan_end,
+                      &T_L_S_end)) {
+                T_end = T_L_S_end;
+                duration = scan_duration_ms;
               } else {
-                constexpr int64_t kMsToNs = 1000000;
-                const int64_t start_ns =
-                    rclcpp::Time(lidar_msg->header.stamp).nanoseconds();
-                const rclcpp::Time scan_end(
-                    start_ns +
-                    static_cast<int64_t>(scan_duration_ms) * kMsToNs);
-                nvblox::Transform T_L_S_end;
-                if (lookupTf(
-                        global_frame_, lidar_msg->header.frame_id, scan_end,
-                        &T_L_S_end)) {
-                  T_end = T_L_S_end;
-                  duration = scan_duration_ms;
-                } else {
-                  RCLCPP_WARN_THROTTLE(
-                      get_logger(), *get_clock(), 5000,
-                      "Lidar MC: TF at scan end failed; integrating without MC");
-                  do_mc = false;
-                }
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 5000,
+                    "Lidar MC: TF at scan end failed; integrating without MC");
+                do_mc = false;
               }
             }
-            mapper_->integrateLidar(
-                cloud, T_L_S, lidar_, do_mc, T_end, duration);
-            maybePublishLidarDepthImage(
-                cloud, T_L_S, do_mc, T_end, duration, lidar_msg->header);
-            if (stamp_for_map.nanoseconds() == 0) {
-              stamp_for_map = lidar_msg->header.stamp;
-            }
-            any_integrate = true;
-            std::lock_guard<std::mutex> lock(inbox_mutex_);
-            if (pending_lidar_ == lidar_msg) {
-              pending_lidar_.reset();
-            }
+          }
+          mapper_->integrateLidar(
+              cloud, T_L_S, lidar_, do_mc, T_end, duration);
+          maybePublishLidarDepthImage(
+              cloud, T_L_S, do_mc, T_end, duration, lidar_msg->header);
+          if (stamp_for_map.nanoseconds() == 0) {
+            stamp_for_map = lidar_msg->header.stamp;
+          }
+          any_integrate = true;
+          std::lock_guard<std::mutex> lock(inbox_mutex_);
+          if (pending_lidar_ == lidar_msg) {
+            pending_lidar_.reset();
           }
         }
-        integrate_ms += std::chrono::duration<double, std::milli>(
-                            Clock::now() - t0)
-                            .count();
       }
+      integrate_ms += std::chrono::duration<double, std::milli>(
+                          Clock::now() - t0)
+                          .count();
     }
 
     for (auto& pc : pending_cams) {
@@ -1303,8 +1290,8 @@ class MappingNode : public rclcpp::Node {
       mapper_->clearOutsideRadius(T_L_clear.translation());
     }
 
-    // Skip empty ticks when extract_on_depth (wait for real depth).
-    if (extract_on_depth_ && !any_integrate) {
+    // Event-driven: skip BEV when this wake had no new integrate (save-only).
+    if (!any_integrate && !map_cleared) {
       return;
     }
 
@@ -1326,6 +1313,9 @@ class MappingNode : public rclcpp::Node {
         std::chrono::duration<double, std::milli>(Clock::now() - t_handoff)
             .count();
     job.handoff_ms = handoff_ms;
+    job.loop1_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t_all)
+            .count();
     {
       std::lock_guard<std::mutex> lock(pub_mutex_);
       // Latest-only: drop stale BEV if loop2 is behind.
@@ -1335,17 +1325,6 @@ class MappingNode : public rclcpp::Node {
 
     maybePublishTsdfColorMesh(stamp);
     maybePublishTsdfVoxels(stamp);
-
-    const double loop1_ms =
-        std::chrono::duration<double, std::milli>(Clock::now() - t_all)
-            .count();
-    if (log_extract_timing_) {
-      RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 60000,
-          "loop1 %.1fms (integrate %.1f bev %.1f handoff %.1f) grid %dx%d",
-          loop1_ms, integrate_ms, bev_timing.bev_ms, handoff_ms, grid_w,
-          grid_h);
-    }
   }
 
   void publishLoop()
@@ -1376,18 +1355,11 @@ class MappingNode : public rclcpp::Node {
 
       {
         std_msgs::msg::Float64MultiArray tmsg;
-        // [integrate, bev, handoff, inpaint, slope, colorize, loop2_wall]
+        // [integrate, bev, handoff, inpaint, slope, colorize, loop1, loop2]
         tmsg.data = {
             job.integrate_ms, job.bev_ms, job.handoff_ms, fin.inpaint_ms,
-            fin.slope_ms, fin.colorize_ms, finish_ms};
+            fin.slope_ms, fin.colorize_ms, job.loop1_ms, finish_ms};
         extract_timing_pub_->publish(tmsg);
-      }
-      if (log_extract_timing_) {
-        RCLCPP_INFO_THROTTLE(
-            get_logger(), *get_clock(), 60000,
-            "loop2 %.1fms (inpaint %.1f slope %.1f colorize %.1f) grid %dx%d",
-            finish_ms, fin.inpaint_ms, fin.slope_ms, fin.colorize_ms,
-            job.maps.width, job.maps.height);
       }
 
       std_msgs::msg::Header header;
@@ -1413,15 +1385,6 @@ class MappingNode : public rclcpp::Node {
             matToImageMsg(job.maps.elevation, header, "32FC1");
         local_map.costmap = matToImageMsg(job.maps.cost, header, "32FC1");
         local_map_pub_->publish(std::move(local_map));
-      }
-
-      const size_t cost_subs =
-          costmap_pub_->get_subscription_count() +
-          costmap_pub_->get_intra_process_subscription_count();
-      if (cost_subs > 0) {
-        costmap_pub_->publish(costToOccupancyGrid(
-            job.maps.cost, header, job.maps.resolution, job.maps.origin_x,
-            job.maps.origin_y, job.clearing_z));
       }
       maybeDumpElev(job.stamp, job.maps);
     }
@@ -2073,6 +2036,39 @@ class MappingNode : public rclcpp::Node {
     }
   }
 
+  bool maybeClearMap()
+  {
+    bool do_clear = false;
+    {
+      std::lock_guard<std::mutex> lock(wake_mutex_);
+      do_clear = clear_requested_;
+      clear_requested_ = false;
+    }
+    if (!do_clear) {
+      return false;
+    }
+
+    const size_t tsdf_blocks = mapper_->mapper().tsdf_layer().numBlocks();
+    const size_t color_blocks = mapper_->mapper().color_layer().numBlocks();
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    mapper_->clear();
+    {
+      std::lock_guard<std::mutex> lock(pub_mutex_);
+      pending_pub_.reset();
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+    RCLCPP_WARN(
+        get_logger(),
+        "map_clear: empty TSDF in %.1fms (dropped tsdf_blocks=%zu "
+        "color_blocks=%zu). Prior BEV unchanged. Live integrate continues.",
+        ms, tsdf_blocks, color_blocks);
+    return true;
+  }
+
   void maybeDumpElev(const rclcpp::Time& stamp, const LocalMaps& maps)
   {
     if (dump_elev_dir_.empty() || maps.width <= 0 || maps.height <= 0) {
@@ -2139,6 +2135,7 @@ class MappingNode : public rclcpp::Node {
   bool do_inpaint_{true};
   float inpaint_resolution_m_{0.25f};
   int inpaint_radius_{3};
+  int elev_median_ksize_{5};
   float unobserved_luminance_{128.f};
   float color_weight_min_{1e-3f};
   float color_z_search_half_band_m_{0.f};
@@ -2176,7 +2173,7 @@ class MappingNode : public rclcpp::Node {
   double integrate_depth_rate_hz_{20.0};
   double integrate_color_rate_hz_{20.0};
   double integrate_lidar_rate_hz_{10.0};
-  bool log_extract_timing_{true};
+  bool log_extract_timing_{false};
   bool publish_tsdf_color_mesh_{false};
   double tsdf_color_mesh_rate_hz_{1.0};
   int tsdf_color_mesh_max_triangles_{500000};
@@ -2194,6 +2191,7 @@ class MappingNode : public rclcpp::Node {
   double dump_elev_rate_hz_{20.0};
   int dump_elev_n_frames_{0};
   std::string layer_cake_path_;
+  std::string map_clear_topic_{"~/map_clear"};
   std::string prior_layer_cake_path_;
   std::vector<double> prior_xyz_yaw_{0.0, 0.0, 0.0, 0.0};
   bool prior_fill_enabled_{true};
@@ -2215,7 +2213,6 @@ class MappingNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;
   rclcpp::Publisher<hound_mapping::msg::LocalMap>::SharedPtr local_map_pub_;
-  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
       tsdf_color_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr
@@ -2231,6 +2228,7 @@ class MappingNode : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr
       extract_timing_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_srv_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr map_clear_sub_;
 
   std::mutex inbox_mutex_;
   sensor_msgs::msg::Image::ConstSharedPtr pending_mask_;
@@ -2247,6 +2245,7 @@ class MappingNode : public rclcpp::Node {
   bool worker_running_{false};
   bool drain_soon_{false};
   bool save_requested_{false};
+  bool clear_requested_{false};
 
   std::thread publish_thread_;
   std::mutex pub_mutex_;

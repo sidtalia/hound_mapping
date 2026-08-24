@@ -35,6 +35,8 @@ struct ElevationCostConfig {
   /// Resolution used for Telea (m). Coarser ⇒ faster. Typical 0.25.
   float inpaint_resolution_m = 0.25f;
   int inpaint_radius = 3;
+  /// Median on elev before slope/normals. OpenCV 32F allows 3 or 5; 0 = off.
+  int elev_median_ksize = 5;
 };
 
 struct LocalMaps {
@@ -89,7 +91,7 @@ class ElevationCostExtractor {
       float z_max, float unknown_elev_z, ExtractTiming* timing = nullptr,
       bool use_prior = true);
 
-  /// Loop2: inpaint elev+cost(+lum) → slope/normals → elev_color.
+  /// Loop2: inpaint elev → median → slope/normals → elev_color.
   void finishLocalMap(LocalMaps* maps, ExtractTiming* timing = nullptr);
 
   /// Full pipeline (BEV + finish). Used by offline smoke tools.

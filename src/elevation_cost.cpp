@@ -246,6 +246,16 @@ void ElevationCostExtractor::finishLocalMap(
     inpaint_ms = msSince(t0);
   }
 
+  // Kill pebble-scale spikes before finite-difference normals.
+  // CV_32F medianBlur only accepts ksize 3 or 5.
+  if (config_.elev_median_ksize >= 3) {
+    int k = config_.elev_median_ksize | 1;
+    k = std::min(k, 5);
+    cv::Mat smoothed;
+    cv::medianBlur(maps->elevation, smoothed, k);
+    maps->elevation = smoothed;
+  }
+
   if (maps->normals.empty() || maps->normals.size() != maps->elevation.size()) {
     maps->normals.create(maps->height, maps->width, CV_32FC3);
   }
