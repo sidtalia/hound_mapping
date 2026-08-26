@@ -14,10 +14,12 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <nav_msgs/msg/map_meta_data.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -26,10 +28,10 @@
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 #include <visualization_msgs/msg/marker.hpp>
-#include <tf2_eigen/tf2_eigen.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
+
+#include <Eigen/Geometry>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -41,6 +43,7 @@
 #include "hound_mapping/elevation_cost.hpp"
 #include "hound_mapping/mapper_core.hpp"
 #include "hound_mapping/msg/local_map.hpp"
+#include "hound_mapping/odom_pose_buffer.hpp"
 #include "hound_mapping/prior_bev_gpu.hpp"
 
 namespace hound_mapping {
@@ -68,6 +71,18 @@ nvblox::Transform toNvblox(const Eigen::Isometry3d& T)
   nvblox::Transform out;
   out.matrix() = T.matrix().cast<float>();
   return out;
+}
+
+Eigen::Isometry3d isometryFromTf(const geometry_msgs::msg::Transform& t)
+{
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  T.translation() = Eigen::Vector3d(
+      t.translation.x, t.translation.y, t.translation.z);
+  T.linear() = Eigen::Quaterniond(
+      t.rotation.w, t.rotation.x, t.rotation.y, t.rotation.z)
+      .normalized()
+      .toRotationMatrix();
+  return T;
 }
 
 std::optional<nvblox::Camera> cameraFromInfo(
@@ -339,12 +354,17 @@ class MappingNode : public rclcpp::Node {
     declareParams();
     loadParams();
 
-    MapperConfig mc;
-    mc.voxel_size_m = voxel_size_;
-    mc.max_integration_distance_m = max_integration_distance_m_;
-    mc.lidar_max_integration_distance_m = lidar_max_integration_distance_m_;
-    mc.map_clearing_radius_m = map_clearing_radius_m_;
-    mapper_ = std::make_unique<MapperCore>(mc);
+    mapper_ = std::make_unique<MapperCore>(makeMapperConfig());
+    RCLCPP_INFO(
+        get_logger(),
+        "nvblox integrators: tsdf_max=%.1fm lidar_max=%.1fm color_max=%.1fm "
+        "color_tracer=%.1fm trunc=%.1fvox max_w=%.1f weighting=%s "
+        "raycast_sub=%d color_trace_sub=%d meas_w=%.2f invalid_decay=%.2f",
+        max_integration_distance_m_, lidar_max_integration_distance_m_,
+        color_max_integration_distance_m_, color_sphere_tracer_max_ray_length_m_,
+        truncation_distance_vox_, projective_max_weight_, weighting_mode_.c_str(),
+        raycast_subsampling_factor_, color_sphere_tracing_ray_subsampling_factor_,
+        color_measurement_weight_, invalid_depth_decay_factor_);
 
     ElevationCostConfig ec;
     ec.resolution_m = elevation_resolution_m_ > 0.f
@@ -396,14 +416,23 @@ class MappingNode : public rclcpp::Node {
     }
     lidar_stream_ = std::make_shared<nvblox::CudaStreamOwning>();
 
-    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    odom_poses_.set_horizon_s(pose_buffer_s_);
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic_, rclcpp::SensorDataQoS(),
+        [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) { onOdom(msg); });
+    const auto static_qos =
+        rclcpp::QoS(rclcpp::KeepLast(100)).transient_local().reliable();
+    tf_static_sub_ = create_subscription<tf2_msgs::msg::TFMessage>(
+        "/tf_static", static_qos,
+        [this](tf2_msgs::msg::TFMessage::ConstSharedPtr msg) {
+          onTfStatic(*msg);
+        });
 
     // Latest-only, best-effort: extra readers (RViz, ros2 topic hz) must not
     // stall the mapper with reliable backpressure.
     local_map_pub_ =
         create_publisher<hound_mapping::msg::LocalMap>(
-            "~/local_map", rclcpp::QoS(1).best_effort());
+            "~/local_map", rclcpp::QoS(5).best_effort());
     tsdf_color_cloud_pub_ =
         create_publisher<sensor_msgs::msg::PointCloud2>("~/tsdf_color_cloud", 1);
     tsdf_color_mesh_pub_ =
@@ -576,8 +605,9 @@ class MappingNode : public rclcpp::Node {
     RCLCPP_INFO(
         get_logger(),
         "hound_mapping ready: depth=%d color=%d lidar=%d voxel=%.3f "
-        "local_map=%.1fm clear_r=%.1fm loop1=integrate+BEV on new data "
-        "loop2=inpaint/publish extract_on_depth=%d "
+        "local_map=%.1fm clear_r=%.1fm mapper_hz=%.1f "
+        "loop1=integrate+BEV every tick loop2=inpaint/publish extract_on_depth=%d "
+        "odom=%s pose_buf=%.1fs base=%s "
         "debug_semantic_all_traversable=%d "
         "save_layer_cake=~/save_layer_cake path=%s "
         "map_clear=%s "
@@ -586,7 +616,8 @@ class MappingNode : public rclcpp::Node {
         use_depth_, use_color_, use_lidar_, voxel_size_,
         local_map_size_m_ > 0.f ? local_map_size_m_
                                 : (2.f * map_clearing_radius_m_),
-        map_clearing_radius_m_, extract_on_depth_ ? 1 : 0,
+        map_clearing_radius_m_, mapper_rate_hz_, extract_on_depth_ ? 1 : 0,
+        odom_topic_.c_str(), pose_buffer_s_, base_frame_.c_str(),
         debug_semantic_all_traversable_ ? 1 : 0,
         layer_cake_path_.empty() ? "(unset)" : layer_cake_path_.c_str(),
         map_clear_topic_.c_str(),
@@ -645,9 +676,31 @@ class MappingNode : public rclcpp::Node {
     double loop1_ms{0.0};
   };
 
+  MapperConfig makeMapperConfig() const
+  {
+    MapperConfig mc;
+    mc.voxel_size_m = voxel_size_;
+    mc.max_integration_distance_m = max_integration_distance_m_;
+    mc.lidar_max_integration_distance_m = lidar_max_integration_distance_m_;
+    mc.map_clearing_radius_m = map_clearing_radius_m_;
+    mc.truncation_distance_vox = truncation_distance_vox_;
+    mc.max_weight = projective_max_weight_;
+    mc.weighting_function_type = parseWeightingMode(weighting_mode_);
+    mc.invalid_depth_decay_factor = invalid_depth_decay_factor_;
+    mc.raycast_subsampling_factor = raycast_subsampling_factor_;
+    mc.color_max_integration_distance_m = color_max_integration_distance_m_;
+    mc.color_sphere_tracer_max_ray_length_m =
+        color_sphere_tracer_max_ray_length_m_;
+    mc.color_sphere_tracing_ray_subsampling_factor =
+        color_sphere_tracing_ray_subsampling_factor_;
+    mc.color_measurement_weight = color_measurement_weight_;
+    return mc;
+  }
+
   void declareParams()
   {
     declare_parameter("global_frame", "odom");
+    declare_parameter("base_frame", "base_link");
     declare_parameter("map_clearing_frame_id", "camera_link");
     declare_parameter("voxel_size", 0.05);
     declare_parameter("elevation_resolution", 0.05);
@@ -658,6 +711,15 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("local_map_size_m", 0.0);
     declare_parameter("max_integration_distance_m", 15.0);
     declare_parameter("lidar_max_integration_distance_m", 15.0);
+    declare_parameter("truncation_distance_vox", 4.0);
+    declare_parameter("projective_max_weight", 5.0);
+    declare_parameter("weighting_mode", "inverse_square");
+    declare_parameter("invalid_depth_decay_factor", -1.0);
+    declare_parameter("raycast_subsampling_factor", 4);
+    declare_parameter("color_max_integration_distance_m", 7.0);
+    declare_parameter("color_sphere_tracer_max_ray_length_m", 15.0);
+    declare_parameter("color_sphere_tracing_ray_subsampling_factor", 4);
+    declare_parameter("color_measurement_weight", 0.8);
     declare_parameter("lethal_slope_deg", 60.0);
     declare_parameter("do_inpaint", true);
     declare_parameter("inpaint_resolution_m", 0.25);
@@ -746,14 +808,17 @@ class MappingNode : public rclcpp::Node {
     declare_parameter(
         "prior_xyz_yaw", std::vector<double>{0.0, 0.0, 0.0, 0.0});
     declare_parameter("prior_fill_enabled", true);
-    // TF: bag replay often has sensor stamps a few ms ahead of /tf.
+    // Local odom ring + /tf_static (no tf2_ros::Buffer on the worker).
     declare_parameter("tf_lookup_timeout_s", 0.05);
     declare_parameter("tf_fallback_to_latest", true);
+    declare_parameter("odom_topic", "/ekf/odometry");
+    declare_parameter("pose_buffer_s", 1.0);
   }
 
   void loadParams()
   {
     global_frame_ = get_parameter("global_frame").as_string();
+    base_frame_ = get_parameter("base_frame").as_string();
     map_clearing_frame_ = get_parameter("map_clearing_frame_id").as_string();
     voxel_size_ = static_cast<float>(get_parameter("voxel_size").as_double());
     elevation_resolution_m_ =
@@ -767,6 +832,33 @@ class MappingNode : public rclcpp::Node {
         get_parameter("max_integration_distance_m").as_double());
     lidar_max_integration_distance_m_ = static_cast<float>(
         get_parameter("lidar_max_integration_distance_m").as_double());
+    truncation_distance_vox_ = static_cast<float>(
+        get_parameter("truncation_distance_vox").as_double());
+    projective_max_weight_ = static_cast<float>(
+        get_parameter("projective_max_weight").as_double());
+    weighting_mode_ = get_parameter("weighting_mode").as_string();
+    {
+      bool ok = true;
+      parseWeightingMode(weighting_mode_, &ok);
+      if (!ok) {
+        RCLCPP_WARN(
+            get_logger(),
+            "unknown weighting_mode '%s'; using inverse_square",
+            weighting_mode_.c_str());
+      }
+    }
+    invalid_depth_decay_factor_ = static_cast<float>(
+        get_parameter("invalid_depth_decay_factor").as_double());
+    raycast_subsampling_factor_ =
+        static_cast<int>(get_parameter("raycast_subsampling_factor").as_int());
+    color_max_integration_distance_m_ = static_cast<float>(
+        get_parameter("color_max_integration_distance_m").as_double());
+    color_sphere_tracer_max_ray_length_m_ = static_cast<float>(
+        get_parameter("color_sphere_tracer_max_ray_length_m").as_double());
+    color_sphere_tracing_ray_subsampling_factor_ = static_cast<int>(
+        get_parameter("color_sphere_tracing_ray_subsampling_factor").as_int());
+    color_measurement_weight_ = static_cast<float>(
+        get_parameter("color_measurement_weight").as_double());
     lethal_slope_deg_ =
         static_cast<float>(get_parameter("lethal_slope_deg").as_double());
     do_inpaint_ = get_parameter("do_inpaint").as_bool();
@@ -882,6 +974,9 @@ class MappingNode : public rclcpp::Node {
     prior_fill_enabled_ = get_parameter("prior_fill_enabled").as_bool();
     tf_lookup_timeout_s_ = get_parameter("tf_lookup_timeout_s").as_double();
     tf_fallback_to_latest_ = get_parameter("tf_fallback_to_latest").as_bool();
+    odom_topic_ = get_parameter("odom_topic").as_string();
+    pose_buffer_s_ = get_parameter("pose_buffer_s").as_double();
+    (void)tf_lookup_timeout_s_;
     if (!dump_elev_dir_.empty()) {
       RCLCPP_INFO(
           get_logger(), "dump_elev_dir=%s rate=%.3fHz n_frames=%d",
@@ -990,41 +1085,111 @@ class MappingNode : public rclcpp::Node {
     }
   }
 
+  void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg)
+  {
+    if (!msg) {
+      return;
+    }
+    StampedOdomPose sample;
+    sample.stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+    const auto& p = msg->pose.pose;
+    sample.T_odom_base = Eigen::Isometry3d::Identity();
+    sample.T_odom_base.translation() =
+        Eigen::Vector3d(p.position.x, p.position.y, p.position.z);
+    sample.T_odom_base.linear() =
+        Eigen::Quaterniond(
+            p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z)
+            .normalized()
+            .toRotationMatrix();
+    odom_poses_.push(std::move(sample));
+  }
+
+  void onTfStatic(const tf2_msgs::msg::TFMessage& msg)
+  {
+    std::lock_guard<std::mutex> lock(static_tf_mu_);
+    for (const auto& tf : msg.transforms) {
+      parent_of_[tf.child_frame_id] =
+          {tf.header.frame_id, isometryFromTf(tf.transform)};
+    }
+    T_base_cache_.clear();
+  }
+
+  bool T_base_of(const std::string& frame, Eigen::Isometry3d* T_base_frame)
+  {
+    if (T_base_frame == nullptr) {
+      return false;
+    }
+    if (frame == base_frame_) {
+      *T_base_frame = Eigen::Isometry3d::Identity();
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(static_tf_mu_);
+    if (const auto cached = T_base_cache_.find(frame);
+        cached != T_base_cache_.end())
+    {
+      *T_base_frame = cached->second;
+      return true;
+    }
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    std::string cur = frame;
+    for (int hops = 0; hops < 16; ++hops) {
+      if (cur == base_frame_) {
+        T_base_cache_[frame] = T;
+        *T_base_frame = T;
+        return true;
+      }
+      const auto it = parent_of_.find(cur);
+      if (it == parent_of_.end()) {
+        return false;
+      }
+      T = it->second.second * T;
+      cur = it->second.first;
+    }
+    return false;
+  }
+
   bool lookupTf(
       const std::string& target, const std::string& source,
       const rclcpp::Time& stamp, nvblox::Transform* T_target_source)
   {
-    const auto timeout =
-        rclcpp::Duration::from_seconds(std::max(0.0, tf_lookup_timeout_s_));
-    try {
-      const auto tf = tf_buffer_->lookupTransform(
-          target, source, stamp, timeout);
-      *T_target_source = toNvblox(tf2::transformToEigen(tf.transform));
-      return true;
-    } catch (const tf2::TransformException& ex) {
-      if (tf_fallback_to_latest_) {
-        try {
-          // TimePointZero = latest; tolerates bag TF lag / slight stamp skew.
-          const auto tf = tf_buffer_->lookupTransform(
-              target, source, rclcpp::Time(0, 0, RCL_ROS_TIME));
-          *T_target_source = toNvblox(tf2::transformToEigen(tf.transform));
-          RCLCPP_WARN_THROTTLE(
-              get_logger(), *get_clock(), 5000,
-              "TF %s <- %s: using latest (stamp lookup failed: %s)",
-              target.c_str(), source.c_str(), ex.what());
-          return true;
-        } catch (const tf2::TransformException& ex2) {
-          RCLCPP_WARN_THROTTLE(
-              get_logger(), *get_clock(), 2000, "TF %s <- %s failed: %s",
-              target.c_str(), source.c_str(), ex2.what());
-          return false;
-        }
-      }
-      RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000, "TF %s <- %s failed: %s",
-          target.c_str(), source.c_str(), ex.what());
+    if (T_target_source == nullptr) {
       return false;
     }
+    if (target != global_frame_) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "pose buffer only supports target=%s (got %s <- %s)",
+          global_frame_.c_str(), target.c_str(), source.c_str());
+      return false;
+    }
+    if (source == global_frame_) {
+      *T_target_source = nvblox::Transform::Identity();
+      return true;
+    }
+
+    Eigen::Isometry3d T_odom_base = Eigen::Isometry3d::Identity();
+    const int64_t stamp_ns = stamp.nanoseconds();
+    const bool ok = (stamp_ns > 0)
+        ? odom_poses_.pose_at(stamp_ns, &T_odom_base, tf_fallback_to_latest_)
+        : odom_poses_.latest(&T_odom_base);
+    if (!ok) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "odom pose buffer miss %s <- %s @ %.3f",
+          target.c_str(), source.c_str(), stamp.seconds());
+      return false;
+    }
+
+    Eigen::Isometry3d T_base_src = Eigen::Isometry3d::Identity();
+    if (source != base_frame_ && !T_base_of(source, &T_base_src)) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "no static TF chain %s <- %s (need /tf_static to %s)",
+          base_frame_.c_str(), source.c_str(), base_frame_.c_str());
+      return false;
+    }
+    *T_target_source = toNvblox(T_odom_base * T_base_src);
+    return true;
   }
 
   void requestDrainSoon()
@@ -1038,21 +1203,26 @@ class MappingNode : public rclcpp::Node {
 
   void workerLoop()
   {
+    using Clock = std::chrono::steady_clock;
+    const double hz = mapper_rate_hz_ > 1e-3 ? mapper_rate_hz_ : 10.0;
+    const auto period = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(1.0 / hz));
     while (true) {
       {
-        std::unique_lock<std::mutex> lock(wake_mutex_);
-        if (!worker_running_) {
-          return;
-        }
-        wake_cv_.wait(lock, [this]() {
-          return drain_soon_ || !worker_running_;
-        });
-        drain_soon_ = false;
+        std::lock_guard<std::mutex> lock(wake_mutex_);
         if (!worker_running_) {
           return;
         }
       }
+      const auto start = Clock::now();
       drainOnce();
+      std::unique_lock<std::mutex> lock(wake_mutex_);
+      wake_cv_.wait_until(lock, start + period, [this]() {
+        return !worker_running_;
+      });
+      if (!worker_running_) {
+        return;
+      }
     }
   }
 
@@ -1290,10 +1460,8 @@ class MappingNode : public rclcpp::Node {
       mapper_->clearOutsideRadius(T_L_clear.translation());
     }
 
-    // Event-driven: skip BEV when this wake had no new integrate (save-only).
-    if (!any_integrate && !map_cleared) {
-      return;
-    }
+    (void)any_integrate;
+    (void)map_cleared;
 
     ExtractTiming bev_timing;
     LocalMaps maps = extractor_->extractBev(
@@ -1353,38 +1521,48 @@ class MappingNode : public rclcpp::Node {
       const double finish_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
-      {
-        std_msgs::msg::Float64MultiArray tmsg;
-        // [integrate, bev, handoff, inpaint, slope, colorize, loop1, loop2]
-        tmsg.data = {
-            job.integrate_ms, job.bev_ms, job.handoff_ms, fin.inpaint_ms,
-            fin.slope_ms, fin.colorize_ms, job.loop1_ms, finish_ms};
-        extract_timing_pub_->publish(tmsg);
-      }
-
       std_msgs::msg::Header header;
       header.stamp = job.stamp;
       header.frame_id = global_frame_;
 
-      // Skip serialize/publish when nobody is listening (RViz/nav off).
-      const size_t local_subs =
-          local_map_pub_->get_subscription_count() +
-          local_map_pub_->get_intra_process_subscription_count();
-      if (local_subs > 0) {
-        hound_mapping::msg::LocalMap local_map;
-        local_map.header = header;
-        local_map.info.map_load_time = job.stamp;
-        local_map.info.resolution = job.maps.resolution;
-        local_map.info.width = static_cast<uint32_t>(job.maps.width);
-        local_map.info.height = static_cast<uint32_t>(job.maps.height);
-        local_map.info.origin.position.x = job.maps.origin_x;
-        local_map.info.origin.position.y = job.maps.origin_y;
-        local_map.info.origin.position.z = job.clearing_z;
-        local_map.info.origin.orientation.w = 1.0;
-        local_map.elevation =
-            matToImageMsg(job.maps.elevation, header, "32FC1");
-        local_map.costmap = matToImageMsg(job.maps.cost, header, "32FC1");
-        local_map_pub_->publish(std::move(local_map));
+      const auto t_ser = Clock::now();
+      hound_mapping::msg::LocalMap local_map;
+      local_map.header = header;
+      local_map.info.map_load_time = job.stamp;
+      local_map.info.resolution = job.maps.resolution;
+      local_map.info.width = static_cast<uint32_t>(job.maps.width);
+      local_map.info.height = static_cast<uint32_t>(job.maps.height);
+      local_map.info.origin.position.x = job.maps.origin_x;
+      local_map.info.origin.position.y = job.maps.origin_y;
+      local_map.info.origin.position.z = job.clearing_z;
+      local_map.info.origin.orientation.w = 1.0;
+      local_map.elevation =
+          matToImageMsg(job.maps.elevation, header, "32FC1");
+      local_map.costmap = matToImageMsg(job.maps.cost, header, "32FC1");
+      local_map_pub_->publish(std::move(local_map));
+      const auto t_pub_done = Clock::now();
+      const double serialize_ms =
+          std::chrono::duration<double, std::milli>(t_pub_done - t_ser).count();
+      double pub_period_ms = 0.0;
+      double pub_hz = 0.0;
+      if (last_local_map_pub_.time_since_epoch().count() != 0) {
+        pub_period_ms = std::chrono::duration<double, std::milli>(
+                            t_pub_done - last_local_map_pub_)
+                            .count();
+        if (pub_period_ms > 1e-3) {
+          pub_hz = 1000.0 / pub_period_ms;
+        }
+      }
+      last_local_map_pub_ = t_pub_done;
+      {
+        std_msgs::msg::Float64MultiArray tmsg;
+        // [integrate, bev, handoff, inpaint, slope, colorize, loop1, loop2,
+        //  serialize+publish, period_between_publishes, hz]
+        tmsg.data = {
+            job.integrate_ms, job.bev_ms, job.handoff_ms, fin.inpaint_ms,
+            fin.slope_ms, fin.colorize_ms, job.loop1_ms, finish_ms,
+            serialize_ms, pub_period_ms, pub_hz};
+        extract_timing_pub_->publish(tmsg);
       }
       maybeDumpElev(job.stamp, job.maps);
     }
@@ -2124,6 +2302,7 @@ class MappingNode : public rclcpp::Node {
 
   // Params
   std::string global_frame_;
+  std::string base_frame_{"base_link"};
   std::string map_clearing_frame_;
   float voxel_size_{0.05f};
   float elevation_resolution_m_{0.05f};
@@ -2131,6 +2310,15 @@ class MappingNode : public rclcpp::Node {
   float local_map_size_m_{0.f};
   float max_integration_distance_m_{15.f};
   float lidar_max_integration_distance_m_{15.f};
+  float truncation_distance_vox_{4.f};
+  float projective_max_weight_{5.f};
+  std::string weighting_mode_{"inverse_square"};
+  float invalid_depth_decay_factor_{-1.f};
+  int raycast_subsampling_factor_{4};
+  float color_max_integration_distance_m_{7.f};
+  float color_sphere_tracer_max_ray_length_m_{15.f};
+  int color_sphere_tracing_ray_subsampling_factor_{4};
+  float color_measurement_weight_{0.8f};
   float lethal_slope_deg_{60.f};
   bool do_inpaint_{true};
   float inpaint_resolution_m_{0.25f};
@@ -2196,7 +2384,9 @@ class MappingNode : public rclcpp::Node {
   std::vector<double> prior_xyz_yaw_{0.0, 0.0, 0.0, 0.0};
   bool prior_fill_enabled_{true};
   double tf_lookup_timeout_s_{0.05};
-  bool tf_fallback_to_latest_{false};
+  bool tf_fallback_to_latest_{true};
+  std::string odom_topic_{"/ekf/odometry"};
+  double pose_buffer_s_{1.0};
 
   std::unique_ptr<MapperCore> mapper_;
   std::unique_ptr<ElevationCostExtractor> extractor_;
@@ -2205,10 +2395,17 @@ class MappingNode : public rclcpp::Node {
   nvblox::Lidar lidar_;
   std::shared_ptr<nvblox::CudaStream> lidar_stream_;
 
-  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  OdomPoseBuffer odom_poses_;
+  std::mutex static_tf_mu_;
+  /** child → (parent, T_parent_child) from /tf_static. */
+  std::unordered_map<std::string, std::pair<std::string, Eigen::Isometry3d>>
+      parent_of_;
+  std::unordered_map<std::string, Eigen::Isometry3d> T_base_cache_;
 
   std::vector<std::shared_ptr<CamSlot>> cam_slots_;
+
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr tf_static_sub_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;
@@ -2252,6 +2449,7 @@ class MappingNode : public rclcpp::Node {
   std::condition_variable pub_cv_;
   bool publish_running_{false};
   std::optional<PublishJob> pending_pub_;
+  std::chrono::steady_clock::time_point last_local_map_pub_{};
 };
 
 }  // namespace hound_mapping

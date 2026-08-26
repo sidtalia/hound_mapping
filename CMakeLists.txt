@@ -16,9 +16,7 @@ find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(tf2_eigen REQUIRED)
+find_package(tf2_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs photo)
 find_package(CUDAToolkit REQUIRED)
 find_package(glog REQUIRED)
@@ -66,9 +64,7 @@ ament_target_dependencies(mapping_node
   visualization_msgs
   std_msgs
   std_srvs
-  tf2
-  tf2_ros
-  tf2_eigen
+  tf2_msgs
 )
 target_link_libraries(mapping_node
   hound_mapping_core
@@ -120,7 +116,7 @@ install(DIRECTORY include/
 
 ament_export_dependencies(
   rclcpp sensor_msgs geometry_msgs nav_msgs visualization_msgs std_msgs
-  tf2 tf2_ros tf2_eigen nvblox
+  tf2_msgs nvblox
 )
 ament_export_include_directories(include)
 ament_package()

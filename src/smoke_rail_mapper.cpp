@@ -199,6 +199,8 @@ int main(int argc, char** argv)
   mc.voxel_size_m = cam.voxel_size;
   mc.map_clearing_radius_m = cam.window_radius_m;
   mc.max_integration_distance_m = cam.max_depth_m + 1.f;
+  mc.color_max_integration_distance_m = mc.max_integration_distance_m;
+  mc.color_sphere_tracer_max_ray_length_m = mc.max_integration_distance_m;
   hound_mapping::MapperCore core(mc);
 
   hound_mapping::ElevationCostConfig ec;
