@@ -5,6 +5,7 @@
 #include <nvblox/core/cuda_stream.h>
 #include <nvblox/map/common_names.h>
 
+#include "hound_mapping/lethal_overlay_gpu.hpp"
 #include "hound_mapping/prior_bev_gpu.hpp"
 
 namespace hound_mapping {
@@ -83,10 +84,12 @@ void tsdf_color_to_bev(
     const PriorBevGpu* prior = nullptr);
 
 /// GPU normals from elev + slope forces free-ness cost to 0 when lethal.
+/// Optional overlay: after slope, sample LethalOverlayGpu and AND (0=lethal).
 void apply_slope_normals_cost(
     TsdfColorToBevWorkspace* workspace, int width, int height, float resolution,
     float lethal_slope_deg, float* elev_host, float* cost_host,
     const uint8_t* observed_host, float* normal_host,
-    const nvblox::CudaStream& cuda_stream);
+    const nvblox::CudaStream& cuda_stream, float origin_x = 0.f,
+    float origin_y = 0.f, const LethalOverlayGpu* overlay = nullptr);
 
 }  // namespace hound_mapping

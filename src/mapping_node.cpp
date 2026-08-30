@@ -41,6 +41,7 @@
 #include <glog/logging.h>
 
 #include "hound_mapping/elevation_cost.hpp"
+#include "hound_mapping/lethal_overlay_gpu.hpp"
 #include "hound_mapping/mapper_core.hpp"
 #include "hound_mapping/msg/local_map.hpp"
 #include "hound_mapping/odom_pose_buffer.hpp"
@@ -428,6 +429,8 @@ class MappingNode : public rclcpp::Node {
     finish_extractor_ = std::make_unique<ElevationCostExtractor>(ec);
     prior_bev_ = std::make_unique<PriorBevGpu>();
     maybeLoadPriorBev(ec);
+    lethal_overlay_ = std::make_unique<LethalOverlayGpu>();
+    maybeLoadLethalOverlay();
 
     lidar_ = nvblox::Lidar(
         lidar_width_, lidar_height_, lidar_min_valid_range_m_,
@@ -669,6 +672,7 @@ class MappingNode : public rclcpp::Node {
         "odom=%s pose_buf=%.1fs base=%s "
         "debug_semantic_all_traversable=%d "
         "save_layer_cake=~/save_layer_cake path=%s "
+        "lethal_map=%s "
         "map_clear=%s "
         "tsdf_color_mesh=%d@%.1fHz tsdf_voxels=%d@%.1fHz "
         "(~/local_map + ~/tsdf_color_cloud|mesh|~/tsdf_voxels)",
@@ -680,6 +684,7 @@ class MappingNode : public rclcpp::Node {
         odom_topic_.c_str(), pose_buffer_s_, base_frame_.c_str(),
         debug_semantic_all_traversable_ ? 1 : 0,
         layer_cake_path_.empty() ? "(unset)" : layer_cake_path_.c_str(),
+        lethal_map_path_.empty() ? "(none/all-free)" : lethal_map_path_.c_str(),
         map_clear_topic_.c_str(),
         publish_tsdf_color_mesh_ ? 1 : 0, tsdf_color_mesh_rate_hz_,
         publish_tsdf_voxels_ ? 1 : 0, tsdf_voxel_rate_hz_);
@@ -1025,6 +1030,8 @@ class MappingNode : public rclcpp::Node {
     declare_parameter(
         "prior_xyz_yaw", std::vector<double>{0.0, 0.0, 0.0, 0.0});
     declare_parameter("prior_fill_enabled", true);
+    // User-authored no-go overlay (empty → all free). Same XY as LayerCake.
+    declare_parameter("lethal_map_path", "");
     declare_parameter("map_frame", "map");
     declare_parameter("save_map_odom_tf", true);
     // Local odom ring + /tf_static (no tf2_ros::Buffer on the worker).
@@ -1183,6 +1190,7 @@ class MappingNode : public rclcpp::Node {
       prior_xyz_yaw_ = {0.0, 0.0, 0.0, 0.0};
     }
     prior_fill_enabled_ = get_parameter("prior_fill_enabled").as_bool();
+    lethal_map_path_ = get_parameter("lethal_map_path").as_string();
     map_frame_ = get_parameter("map_frame").as_string();
     save_map_odom_tf_ = get_parameter("save_map_odom_tf").as_bool();
     tf_lookup_timeout_s_ = get_parameter("tf_lookup_timeout_s").as_double();
@@ -1296,6 +1304,44 @@ class MappingNode : public rclcpp::Node {
       prior_bev_->clear();
       extractor_->setPrior(nullptr);
     }
+  }
+
+  void maybeLoadLethalOverlay()
+  {
+    finish_extractor_->setLethalOverlay(nullptr);
+    if (lethal_map_path_.empty()) {
+      RCLCPP_INFO(
+          get_logger(), "lethal overlay: none (all free)");
+      return;
+    }
+    if (!std::filesystem::exists(lethal_map_path_)) {
+      RCLCPP_ERROR(
+          get_logger(),
+          "lethal_map_path not found (%s); continuing with all-free overlay",
+          lethal_map_path_.c_str());
+      return;
+    }
+
+    const float tx = static_cast<float>(prior_xyz_yaw_[0]);
+    const float ty = static_cast<float>(prior_xyz_yaw_[1]);
+    const float yaw = static_cast<float>(prior_xyz_yaw_[3]);
+    nvblox::CudaStreamOwning upload_stream;
+    std::string err;
+    if (!lethal_overlay_->loadYaml(
+            lethal_map_path_, tx, ty, yaw, upload_stream, &err)) {
+      RCLCPP_ERROR(
+          get_logger(), "lethal overlay load failed: %s", err.c_str());
+      lethal_overlay_->clear();
+      return;
+    }
+    finish_extractor_->setLethalOverlay(lethal_overlay_.get());
+    RCLCPP_INFO(
+        get_logger(),
+        "lethal overlay ready: %dx%d @ %.3fm origin=(%.2f,%.2f) "
+        "T_global_overlay=[%.2f,%.2f,yaw=%.3f] from %s",
+        lethal_overlay_->width, lethal_overlay_->height,
+        lethal_overlay_->resolution, lethal_overlay_->origin_x,
+        lethal_overlay_->origin_y, tx, ty, yaw, lethal_map_path_.c_str());
   }
 
   void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg)
@@ -2664,6 +2710,7 @@ class MappingNode : public rclcpp::Node {
   std::string prior_layer_cake_path_;
   std::vector<double> prior_xyz_yaw_{0.0, 0.0, 0.0, 0.0};
   bool prior_fill_enabled_{true};
+  std::string lethal_map_path_;
   double tf_lookup_timeout_s_{0.05};
   bool tf_fallback_to_latest_{true};
   std::string odom_topic_{"/ekf/odometry"};
@@ -2673,6 +2720,7 @@ class MappingNode : public rclcpp::Node {
   std::unique_ptr<ElevationCostExtractor> extractor_;
   std::unique_ptr<ElevationCostExtractor> finish_extractor_;
   std::unique_ptr<PriorBevGpu> prior_bev_;
+  std::unique_ptr<LethalOverlayGpu> lethal_overlay_;
   nvblox::Lidar lidar_;
   std::shared_ptr<nvblox::CudaStream> lidar_stream_;
 

@@ -32,6 +32,7 @@ add_library(hound_mapping_core
   src/mapper_core.cpp
   src/elevation_cost.cpp
   src/prior_bev_gpu.cpp
+  src/lethal_overlay_gpu.cpp
   cuda/tsdf_color_to_bev.cu
 )
 target_include_directories(hound_mapping_core PUBLIC
@@ -95,8 +96,18 @@ target_link_libraries(layercake_to_mesh_node
 )
 target_compile_features(layercake_to_mesh_node PUBLIC cxx_std_17)
 
+add_executable(layercake_to_bev src/layercake_to_bev.cpp)
+target_link_libraries(layercake_to_bev
+  hound_mapping_core
+  nvblox::nvblox_lib
+  ${OpenCV_LIBS}
+  glog::glog
+)
+target_compile_features(layercake_to_bev PUBLIC cxx_std_17)
+
 install(TARGETS
   hound_mapping_core mapping_node smoke_rail_mapper layercake_to_mesh_node
+  layercake_to_bev
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -104,6 +115,7 @@ install(TARGETS
 install(PROGRAMS
   scripts/generate_rail_dataset.py
   scripts/viser_rail_compare.py
+  scripts/author_lethal_map.py
   scripts/smoke_multicam_rail.sh
   DESTINATION lib/${PROJECT_NAME}
 )

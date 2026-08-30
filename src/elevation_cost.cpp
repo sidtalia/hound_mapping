@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <limits>
+#include <string>
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/photo.hpp>
@@ -54,6 +56,72 @@ TsdfAabb aabbFromTsdfLayer(const nvblox::TsdfLayer& tsdf, float pad_m)
   out.max_z = max_z + pad;
   out.valid = true;
   return out;
+}
+
+bool extractLayerCakeBev(
+    const std::string& cake_path, float voxel_size_m,
+    const ElevationCostConfig& ec, LocalMaps* out, std::string* err)
+{
+  if (!out) {
+    if (err) {
+      *err = "out is null";
+    }
+    return false;
+  }
+  if (cake_path.empty() || !std::filesystem::exists(cake_path)) {
+    if (err) {
+      *err = "layercake not found: " + cake_path;
+    }
+    return false;
+  }
+
+  MapperConfig mc;
+  mc.voxel_size_m = voxel_size_m > 0.f ? voxel_size_m : 0.05f;
+  MapperCore core(mc);
+  if (!core.loadLayerCake(cake_path)) {
+    if (err) {
+      *err = "loadLayerCake failed: " + cake_path;
+    }
+    return false;
+  }
+
+  const nvblox::TsdfLayer& tsdf = core.mapper().tsdf_layer();
+  const nvblox::ColorLayer& color = core.mapper().color_layer();
+  const float pad = tsdf.block_size();
+  const TsdfAabb aabb = aabbFromTsdfLayer(tsdf, pad);
+  if (!aabb.valid) {
+    if (err) {
+      *err = "LayerCake has no TSDF blocks: " + cake_path;
+    }
+    return false;
+  }
+
+  const float res = ec.resolution_m > 0.f ? ec.resolution_m : mc.voxel_size_m;
+  const int width = std::max(
+      1, static_cast<int>(std::ceil((aabb.max_x - aabb.min_x) / res)));
+  const int height = std::max(
+      1, static_cast<int>(std::ceil((aabb.max_y - aabb.min_y) / res)));
+  constexpr int kMaxDim = 8192;
+  if (width > kMaxDim || height > kMaxDim) {
+    if (err) {
+      *err = "BEV too large (" + std::to_string(width) + "x" +
+          std::to_string(height) + ")";
+    }
+    return false;
+  }
+
+  ElevationCostExtractor ext(ec);
+  *out = ext.extractBevGrid(
+      tsdf, color, aabb.min_x, aabb.min_y, width, height, aabb.min_z,
+      aabb.max_z, 0.5f * (aabb.min_z + aabb.max_z), nullptr,
+      /*use_prior=*/false);
+  if (out->width <= 0 || out->elevation.empty()) {
+    if (err) {
+      *err = "extractBevGrid returned empty";
+    }
+    return false;
+  }
+  return true;
 }
 
 ElevationCostExtractor::ElevationCostExtractor(const ElevationCostConfig& config)
@@ -267,11 +335,14 @@ void ElevationCostExtractor::finishLocalMap(
   }
 
   auto t0 = Clock::now();
+  const LethalOverlayGpu* overlay_arg =
+      (overlay_ && overlay_->enabled && overlay_->mask_d) ? overlay_ : nullptr;
   apply_slope_normals_cost(
       &bev_ws_, maps->width, maps->height, maps->resolution,
       config_.lethal_slope_deg, reinterpret_cast<float*>(maps->elevation.data),
       reinterpret_cast<float*>(maps->cost.data), maps->observed.data,
-      reinterpret_cast<float*>(maps->normals.data), *cuda_stream_);
+      reinterpret_cast<float*>(maps->normals.data), *cuda_stream_,
+      maps->origin_x, maps->origin_y, overlay_arg);
   const double slope_ms = msSince(t0);
 
   t0 = Clock::now();

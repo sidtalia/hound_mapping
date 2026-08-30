@@ -2,12 +2,14 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 
 #include <opencv2/core.hpp>
 
 #include <nvblox/core/cuda_stream.h>
 #include <nvblox/nvblox.h>
 
+#include "hound_mapping/lethal_overlay_gpu.hpp"
 #include "hound_mapping/mapper_core.hpp"
 #include "hound_mapping/prior_bev_gpu.hpp"
 #include "hound_mapping/tsdf_color_to_bev.hpp"
@@ -70,6 +72,11 @@ struct TsdfAabb {
 
 TsdfAabb aabbFromTsdfLayer(const nvblox::TsdfLayer& tsdf, float pad_m = 0.f);
 
+/// Load a LayerCake and extract a full-coverage BEV (same grid as prior fill).
+bool extractLayerCakeBev(
+    const std::string& cake_path, float voxel_size_m,
+    const ElevationCostConfig& ec, LocalMaps* out, std::string* err = nullptr);
+
 class ElevationCostExtractor {
  public:
   explicit ElevationCostExtractor(const ElevationCostConfig& config);
@@ -77,6 +84,10 @@ class ElevationCostExtractor {
   /// Optional GPU prior sampled in Finalize when live TSDF has no surface.
   void setPrior(const PriorBevGpu* prior) { prior_ = prior; }
   const PriorBevGpu* prior() const { return prior_; }
+
+  /// Optional no-go overlay. Applied in finishLocalMap after slope (AND).
+  void setLethalOverlay(const LethalOverlayGpu* overlay) { overlay_ = overlay; }
+  const LethalOverlayGpu* lethalOverlay() const { return overlay_; }
 
   /// Loop1: TSDF/color → elev/cost/obs/lum (owned clones). No inpaint/normals.
   LocalMaps extractBev(
@@ -115,6 +126,7 @@ class ElevationCostExtractor {
   std::shared_ptr<nvblox::CudaStream> cuda_stream_;
   TsdfColorToBevWorkspace bev_ws_;
   const PriorBevGpu* prior_{nullptr};
+  const LethalOverlayGpu* overlay_{nullptr};
 
   cv::Mat elevation_;
   cv::Mat observed_;

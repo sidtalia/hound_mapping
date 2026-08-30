@@ -303,6 +303,39 @@ __global__ void finalize_from_bits_kernel(
   }
 }
 
+/// Sample overlay at each BEV cell (same T_global_overlay as prior).
+/// Overlay 0 = lethal → force cost 0. Out of bounds = free (leave cost).
+__global__ void lethal_overlay_and_kernel(
+    float* cost, int width, int height, float origin_x, float origin_y,
+    float resolution, const float* mask, float ox, float oy, float ores,
+    int ow, int oh, float tx, float ty, float yaw) {
+  const int ix = blockIdx.x * blockDim.x + threadIdx.x;
+  const int iy = blockIdx.y * blockDim.y + threadIdx.y;
+  if (ix >= width || iy >= height || cost == nullptr || mask == nullptr) {
+    return;
+  }
+  if (ow <= 0 || oh <= 0 || !(ores > 0.f) || !(resolution > 0.f)) {
+    return;
+  }
+  const float x = origin_x + (static_cast<float>(ix) + 0.5f) * resolution;
+  const float y = origin_y + (static_cast<float>(iy) + 0.5f) * resolution;
+  const float dx = x - tx;
+  const float dy = y - ty;
+  const float c = cosf(-yaw);
+  const float s = sinf(-yaw);
+  const float xp = c * dx - s * dy;
+  const float yp = s * dx + c * dy;
+  const int pix = static_cast<int>(floorf((xp - ox) / ores));
+  const int piy = static_cast<int>(floorf((yp - oy) / ores));
+  if (pix < 0 || piy < 0 || pix >= ow || piy >= oh) {
+    return;
+  }
+  // 0 = lethal, 1 = free. Logical AND of free-ness (0 AND 1 = 0).
+  if (mask[piy * ow + pix] <= 0.5f) {
+    cost[iy * width + ix] = 0.f;
+  }
+}
+
 /// Finite-difference normals from elev; OR slope lethality into cost.
 /// Cost is free-ness [0,255]; slope-lethal forces 0. Unobserved → 0 if
 /// slope-lethal else leave (caller usually left unobserved_luminance).
@@ -643,7 +676,8 @@ void apply_slope_normals_cost(
     TsdfColorToBevWorkspace* workspace, int width, int height, float resolution,
     float lethal_slope_deg, float* elev_host, float* cost_host,
     const uint8_t* observed_host, float* normal_host,
-    const nvblox::CudaStream& cuda_stream) {
+    const nvblox::CudaStream& cuda_stream, float origin_x, float origin_y,
+    const LethalOverlayGpu* overlay) {
   if (workspace == nullptr || elev_host == nullptr || width <= 0 || height <= 0) {
     return;
   }
@@ -680,6 +714,16 @@ void apply_slope_normals_cost(
       observed_host ? workspace->obs_d : nullptr, width, height, resolution,
       cos_thresh);
   checkCuda(cudaGetLastError(), "slope_normals_cost_kernel");
+
+  if (overlay && overlay->enabled && overlay->mask_d && overlay->width > 0 &&
+      overlay->height > 0 && overlay->resolution > 0.f && cost_host) {
+    lethal_overlay_and_kernel<<<b2, t2, 0, cuda_stream>>>(
+        workspace->cost_d, width, height, origin_x, origin_y, resolution,
+        overlay->mask_d, overlay->origin_x, overlay->origin_y,
+        overlay->resolution, overlay->width, overlay->height, overlay->tx,
+        overlay->ty, overlay->yaw);
+    checkCuda(cudaGetLastError(), "lethal_overlay_and_kernel");
+  }
 
   if (cost_host) {
     checkCuda(
