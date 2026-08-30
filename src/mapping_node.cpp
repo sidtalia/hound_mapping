@@ -163,6 +163,42 @@ void zeroDepthBottomFraction(nvblox::DepthImage* depth, double fraction)
   }
 }
 
+struct ImageRoiFrac {
+  float left{0.f};
+  float right{0.f};
+  float top{0.f};
+  float bottom{0.f};
+  bool active() const
+  {
+    return left > 0.f || right > 0.f || top > 0.f || bottom > 0.f;
+  }
+};
+
+void applyDepthRoi(nvblox::DepthImage* depth, const ImageRoiFrac& roi)
+{
+  if (!depth || !roi.active()) {
+    return;
+  }
+  const int rows = depth->rows();
+  const int cols = depth->cols();
+  if (rows <= 0 || cols <= 0) {
+    return;
+  }
+  const int c0 = std::clamp(static_cast<int>(std::lround(roi.left * cols)), 0, cols);
+  const int c1 = std::clamp(
+      static_cast<int>(std::lround((1.f - roi.right) * cols)), 0, cols);
+  const int r0 = std::clamp(static_cast<int>(std::lround(roi.top * rows)), 0, rows);
+  const int r1 = std::clamp(
+      static_cast<int>(std::lround((1.f - roi.bottom) * rows)), 0, rows);
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      if (r < r0 || r >= r1 || c < c0 || c >= c1) {
+        (*depth)(r, c) = 0.f;
+      }
+    }
+  }
+}
+
 bool colorToNvblox(
     const sensor_msgs::msg::Image& msg, nvblox::ColorImage* out)
 {
@@ -460,7 +496,17 @@ class MappingNode : public rclcpp::Node {
                                         const std::string& color_info) {
       auto slot = std::make_shared<CamSlot>();
       slot->name = name;
-      if (use_depth_) {
+      slot->use_depth = use_depth_;
+      slot->use_color = use_color_;
+      slot->integ = defaultCamInteg();
+      const auto cfg_it = cam_cfg_.find(name);
+      if (cfg_it != cam_cfg_.end()) {
+        slot->use_depth = cfg_it->second.use_depth;
+        slot->use_color = cfg_it->second.use_color;
+        slot->roi = cfg_it->second.roi;
+        slot->integ = cfg_it->second.integ;
+      }
+      if (slot->use_depth) {
         slot->depth_info_sub = create_subscription<sensor_msgs::msg::CameraInfo>(
             depth_info, sensor_qos,
             [slot](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
@@ -478,7 +524,7 @@ class MappingNode : public rclcpp::Node {
               requestDrainSoon();
             });
       }
-      if (use_color_) {
+      if (slot->use_color) {
         slot->color_info_sub = create_subscription<sensor_msgs::msg::CameraInfo>(
             color_info, sensor_qos,
             [slot](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
@@ -503,8 +549,14 @@ class MappingNode : public rclcpp::Node {
       }
       cam_slots_.push_back(slot);
       RCLCPP_INFO(
-          get_logger(), "camera[%s] depth=%s color=%s", name.c_str(),
-          depth_topic.c_str(), color_topic.c_str());
+          get_logger(),
+          "camera[%s] depth=%s color=%s use_d=%d use_c=%d roi=%.2f/%.2f/%.2f/%.2f "
+          "tsdf_r=%.1f color_r=%.1f w=%s",
+          name.c_str(), depth_topic.c_str(), color_topic.c_str(),
+          slot->use_depth ? 1 : 0, slot->use_color ? 1 : 0, slot->roi.left,
+          slot->roi.right, slot->roi.top, slot->roi.bottom,
+          slot->integ.max_integration_distance_m,
+          slot->integ.color_max_integration_distance_m, weighting_mode_.c_str());
     };
 
     if (!camera_names_.empty()) {
@@ -602,9 +654,16 @@ class MappingNode : public rclcpp::Node {
     worker_thread_ = std::thread([this]() { workerLoop(); });
     publish_thread_ = std::thread([this]() { publishLoop(); });
 
+    int n_depth = 0;
+    int n_color = 0;
+    for (const auto& slot : cam_slots_) {
+      n_depth += slot->use_depth ? 1 : 0;
+      n_color += slot->use_color ? 1 : 0;
+    }
+
     RCLCPP_INFO(
         get_logger(),
-        "hound_mapping ready: depth=%d color=%d lidar=%d voxel=%.3f "
+        "hound_mapping ready: depth=%d/%zu color=%d/%zu lidar=%d voxel=%.3f "
         "local_map=%.1fm clear_r=%.1fm mapper_hz=%.1f "
         "loop1=integrate+BEV every tick loop2=inpaint/publish extract_on_depth=%d "
         "odom=%s pose_buf=%.1fs base=%s "
@@ -613,7 +672,8 @@ class MappingNode : public rclcpp::Node {
         "map_clear=%s "
         "tsdf_color_mesh=%d@%.1fHz tsdf_voxels=%d@%.1fHz "
         "(~/local_map + ~/tsdf_color_cloud|mesh|~/tsdf_voxels)",
-        use_depth_, use_color_, use_lidar_, voxel_size_,
+        n_depth, cam_slots_.size(), n_color, cam_slots_.size(),
+        use_lidar_, voxel_size_,
         local_map_size_m_ > 0.f ? local_map_size_m_
                                 : (2.f * map_clearing_radius_m_),
         map_clearing_radius_m_, mapper_rate_hz_, extract_on_depth_ ? 1 : 0,
@@ -648,8 +708,19 @@ class MappingNode : public rclcpp::Node {
   }
 
  private:
+  struct CamSensorConfig {
+    bool use_depth{true};
+    bool use_color{true};
+    ImageRoiFrac roi;
+    IntegratorSettings integ;
+  };
+
   struct CamSlot {
     std::string name;
+    bool use_depth{true};
+    bool use_color{true};
+    ImageRoiFrac roi;
+    IntegratorSettings integ;
     std::mutex mu;
     std::optional<nvblox::Camera> depth_camera;
     std::optional<nvblox::Camera> color_camera;
@@ -675,6 +746,155 @@ class MappingNode : public rclcpp::Node {
     double handoff_ms{0.0};
     double loop1_ms{0.0};
   };
+
+  IntegratorSettings defaultCamInteg() const
+  {
+    IntegratorSettings s;
+    s.max_integration_distance_m = max_integration_distance_m_;
+    s.truncation_distance_vox = truncation_distance_vox_;
+    s.max_weight = projective_max_weight_;
+    s.weighting_function_type = parseWeightingMode(weighting_mode_);
+    s.invalid_depth_decay_factor = invalid_depth_decay_factor_;
+    s.ray_subsampling_factor = raycast_subsampling_factor_;
+    s.measurement_weight = color_measurement_weight_;
+    s.color_max_integration_distance_m = color_max_integration_distance_m_;
+    s.sphere_tracer_max_ray_length_m = color_sphere_tracer_max_ray_length_m_;
+    s.sphere_tracing_ray_subsampling_factor =
+        color_sphere_tracing_ray_subsampling_factor_;
+    return s;
+  }
+
+  IntegratorSettings defaultLidarInteg() const
+  {
+    IntegratorSettings s = defaultCamInteg();
+    s.max_integration_distance_m = lidar_max_integration_distance_m_;
+    return s;
+  }
+
+  float paramOr(const std::string& name, float def)
+  {
+    if (!has_parameter(name)) {
+      declare_parameter(name, static_cast<double>(def));
+    }
+    const auto p = get_parameter(name);
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+      return static_cast<float>(p.as_int());
+    }
+    return static_cast<float>(p.as_double());
+  }
+
+  int paramOrInt(const std::string& name, int def)
+  {
+    if (!has_parameter(name)) {
+      declare_parameter(name, static_cast<int64_t>(def));
+    }
+    const auto p = get_parameter(name);
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      return static_cast<int>(p.as_double());
+    }
+    return static_cast<int>(p.as_int());
+  }
+
+  bool paramOrBool(const std::string& name, bool def)
+  {
+    if (!has_parameter(name)) {
+      declare_parameter(name, def);
+    }
+    return get_parameter(name).as_bool();
+  }
+
+  std::string paramOrStr(const std::string& name, const std::string& def)
+  {
+    if (!has_parameter(name)) {
+      declare_parameter(name, def);
+    }
+    return get_parameter(name).as_string();
+  }
+
+  IntegratorSettings loadIntegPrefix(
+      const std::string& prefix, IntegratorSettings s)
+  {
+    s.max_integration_distance_m =
+        paramOr(prefix + "max_integration_distance_m", s.max_integration_distance_m);
+    s.max_integration_distance_m = paramOr(
+        prefix + "depth_integrator_max_integration_distance_m",
+        s.max_integration_distance_m);
+    s.truncation_distance_vox =
+        paramOr(prefix + "truncation_distance_vox", s.truncation_distance_vox);
+    s.max_weight = paramOr(prefix + "max_weight", s.max_weight);
+    const std::string mode = paramOrStr(prefix + "weighting_mode", "");
+    if (!mode.empty()) {
+      bool ok = true;
+      s.weighting_function_type = parseWeightingMode(mode, &ok);
+      if (!ok) {
+        RCLCPP_WARN(
+            get_logger(), "unknown %sweighting_mode '%s'", prefix.c_str(),
+            mode.c_str());
+      }
+    }
+    s.invalid_depth_decay_factor = paramOr(
+        prefix + "invalid_depth_decay_factor", s.invalid_depth_decay_factor);
+    s.ray_subsampling_factor =
+        paramOrInt(prefix + "ray_subsampling_factor", s.ray_subsampling_factor);
+    s.measurement_weight =
+        paramOr(prefix + "measurement_weight", s.measurement_weight);
+    s.sphere_tracer_max_ray_length_m = paramOr(
+        prefix + "sphere_tracer_max_ray_length_m",
+        s.sphere_tracer_max_ray_length_m);
+    s.color_max_integration_distance_m = paramOr(
+        prefix + "color_max_integration_distance_m",
+        s.color_max_integration_distance_m);
+    s.color_max_integration_distance_m = paramOr(
+        prefix + "color_integrator_max_integration_distance_m",
+        s.color_max_integration_distance_m);
+    s.sphere_tracing_ray_subsampling_factor = paramOrInt(
+        prefix + "sphere_tracing_ray_subsampling_factor",
+        s.sphere_tracing_ray_subsampling_factor);
+    const float stw = paramOr(
+        prefix + "sphere_tracing_measurement_weight", s.measurement_weight);
+    if (stw > 0.f) {
+      s.measurement_weight = stw;
+    }
+    return s;
+  }
+
+  void loadPerSensorConfigs()
+  {
+    lidar_integ_ = defaultLidarInteg();
+    lidar_integ_ = loadIntegPrefix("lidar.lidar.projective.", lidar_integ_);
+    use_lidar_ = paramOrBool("lidar.lidar.use_lidar", use_lidar_);
+    const std::string topic = paramOrStr("lidar.lidar.topic", lidar_topic_);
+    if (!topic.empty()) {
+      lidar_topic_ = topic;
+    }
+    lidar_width_ = paramOrInt("lidar.lidar.width", lidar_width_);
+    lidar_height_ = paramOrInt("lidar.lidar.height", lidar_height_);
+    lidar_elevation_below_deg_ = paramOr(
+        "lidar.lidar.elevation_below_deg", lidar_elevation_below_deg_);
+    lidar_elevation_above_deg_ = paramOr(
+        "lidar.lidar.elevation_above_deg", lidar_elevation_above_deg_);
+    lidar_vertical_fov_rad_ =
+        paramOr("lidar.lidar.vertical_fov_rad", lidar_vertical_fov_rad_);
+    lidar_min_valid_range_m_ =
+        paramOr("lidar.lidar.min_valid_range_m", lidar_min_valid_range_m_);
+    use_lidar_motion_compensation_ = paramOrBool(
+        "lidar.lidar.use_lidar_motion_compensation",
+        use_lidar_motion_compensation_);
+
+    cam_cfg_.clear();
+    for (const auto& name : camera_names_) {
+      const std::string p = "camera." + name + ".";
+      CamSensorConfig cfg;
+      cfg.use_depth = paramOrBool(p + "use_depth", use_depth_);
+      cfg.use_color = paramOrBool(p + "use_color", use_color_);
+      cfg.roi.left = paramOr(p + "roi.left", 0.f);
+      cfg.roi.right = paramOr(p + "roi.right", 0.f);
+      cfg.roi.top = paramOr(p + "roi.top", 0.f);
+      cfg.roi.bottom = paramOr(p + "roi.bottom", 0.f);
+      cfg.integ = loadIntegPrefix(p + "projective.", defaultCamInteg());
+      cam_cfg_[name] = cfg;
+    }
+  }
 
   MapperConfig makeMapperConfig() const
   {
@@ -774,9 +994,6 @@ class MappingNode : public rclcpp::Node {
     // Legacy alias: if mapper_rate_hz unset in older launch, still honored via
     // loadParams fallback when publish_map_rate_hz is the only rate set.
     declare_parameter("publish_map_rate_hz", 20.0);
-    declare_parameter("integrate_depth_rate_hz", 20.0);
-    declare_parameter("integrate_color_rate_hz", 20.0);
-    declare_parameter("integrate_lidar_rate_hz", 10.0);
     declare_parameter("map_clear_rate_hz", 20.0);
     declare_parameter("log_extract_timing", false);
     // Debug: publish colored TSDF isosurface (mesh vertices / triangles).
@@ -808,6 +1025,8 @@ class MappingNode : public rclcpp::Node {
     declare_parameter(
         "prior_xyz_yaw", std::vector<double>{0.0, 0.0, 0.0, 0.0});
     declare_parameter("prior_fill_enabled", true);
+    declare_parameter("map_frame", "map");
+    declare_parameter("save_map_odom_tf", true);
     // Local odom ring + /tf_static (no tf2_ros::Buffer on the worker).
     declare_parameter("tf_lookup_timeout_s", 0.05);
     declare_parameter("tf_fallback_to_latest", true);
@@ -921,6 +1140,7 @@ class MappingNode : public rclcpp::Node {
         get_parameter("lidar_min_valid_range_m").as_double());
     use_lidar_motion_compensation_ =
         get_parameter("use_lidar_motion_compensation").as_bool();
+    loadPerSensorConfigs();
 
     mapper_rate_hz_ = get_parameter("mapper_rate_hz").as_double();
     publish_map_rate_hz_ = get_parameter("publish_map_rate_hz").as_double();
@@ -929,15 +1149,6 @@ class MappingNode : public rclcpp::Node {
       mapper_rate_hz_ = publish_map_rate_hz_ > 0.0 ? publish_map_rate_hz_ : 20.0;
     }
 
-    integrate_depth_rate_hz_ =
-        get_parameter("integrate_depth_rate_hz").as_double();
-    integrate_color_rate_hz_ =
-        get_parameter("integrate_color_rate_hz").as_double();
-    integrate_lidar_rate_hz_ =
-        get_parameter("integrate_lidar_rate_hz").as_double();
-    (void)integrate_depth_rate_hz_;
-    (void)integrate_color_rate_hz_;
-    (void)integrate_lidar_rate_hz_;
     map_clear_rate_hz_ = get_parameter("map_clear_rate_hz").as_double();
     log_extract_timing_ = get_parameter("log_extract_timing").as_bool();
     publish_tsdf_color_mesh_ =
@@ -972,6 +1183,8 @@ class MappingNode : public rclcpp::Node {
       prior_xyz_yaw_ = {0.0, 0.0, 0.0, 0.0};
     }
     prior_fill_enabled_ = get_parameter("prior_fill_enabled").as_bool();
+    map_frame_ = get_parameter("map_frame").as_string();
+    save_map_odom_tf_ = get_parameter("save_map_odom_tf").as_bool();
     tf_lookup_timeout_s_ = get_parameter("tf_lookup_timeout_s").as_double();
     tf_fallback_to_latest_ = get_parameter("tf_fallback_to_latest").as_bool();
     odom_topic_ = get_parameter("odom_topic").as_string();
@@ -1275,7 +1488,7 @@ class MappingNode : public rclcpp::Node {
     }
 
     for (auto& pc : pending_cams) {
-      if (!(pc.depth_msg && pc.depth_cam && use_depth_)) {
+      if (!(pc.depth_msg && pc.depth_cam && pc.slot->use_depth)) {
         continue;
       }
       const int64_t ns =
@@ -1291,6 +1504,7 @@ class MappingNode : public rclcpp::Node {
         nvblox::DepthImage depth(nvblox::MemoryType::kHost);
         if (depthToNvblox(*pc.depth_msg, &depth)) {
           zeroDepthBottomFraction(&depth, depth_ignore_bottom_fraction_);
+          applyDepthRoi(&depth, pc.slot->roi);
           std::optional<nvblox::MonoImage> mask;
           if (mask_msg) {
             nvblox::MonoImage m(nvblox::MemoryType::kHost);
@@ -1299,6 +1513,7 @@ class MappingNode : public rclcpp::Node {
               mask = std::move(m);
             }
           }
+          mapper_->applyTsdfSettings(pc.slot->integ, false);
           mapper_->integrateDepth(depth, T_L_C, *pc.depth_cam, mask);
           pc.slot->last_depth_ns = ns;
           stamp_for_map = pc.depth_msg->header.stamp;
@@ -1356,6 +1571,7 @@ class MappingNode : public rclcpp::Node {
               }
             }
           }
+          mapper_->applyTsdfSettings(lidar_integ_, true);
           mapper_->integrateLidar(
               cloud, T_L_S, lidar_, do_mc, T_end, duration);
           maybePublishLidarDepthImage(
@@ -1376,7 +1592,7 @@ class MappingNode : public rclcpp::Node {
     }
 
     for (auto& pc : pending_cams) {
-      if (!use_color_) {
+      if (!pc.slot || !pc.slot->use_color) {
         RCLCPP_DEBUG_THROTTLE(
             get_logger(), *get_clock(), 5000,
             "Skip color integrate [%s]: use_color=false",
@@ -1422,6 +1638,7 @@ class MappingNode : public rclcpp::Node {
           ok = colorToNvblox(*pc.color_msg, &color);
         }
         if (ok) {
+          mapper_->applyColorSettings(pc.slot->integ);
           mapper_->integrateColor(color, T_L_C, *pc.color_cam);
           pc.slot->last_color_ns = ns;
           if (stamp_for_map.nanoseconds() == 0) {
@@ -2205,12 +2422,75 @@ class MappingNode : public rclcpp::Node {
           "file=%.2f MiB) — this tick blocked integrate/BEV",
           ms, layer_cake_path_.c_str(), tsdf_blocks, color_blocks,
           static_cast<double>(bytes) / (1024.0 * 1024.0));
+      maybeSaveMapOdomTf();
     } else {
       RCLCPP_ERROR(
           get_logger(),
           "saveLayerCake FAILED after %.1fms → %s (tsdf_blocks=%zu "
           "color_blocks=%zu)",
           ms, layer_cake_path_.c_str(), tsdf_blocks, color_blocks);
+    }
+  }
+
+  void maybeSaveMapOdomTf()
+  {
+    if (!save_map_odom_tf_ || layer_cake_path_.empty()) {
+      return;
+    }
+    Eigen::Isometry3d T_map_odom = Eigen::Isometry3d::Identity();
+    std::string parent;
+    {
+      std::lock_guard<std::mutex> lock(static_tf_mu_);
+      const auto it = parent_of_.find(global_frame_);
+      if (it == parent_of_.end()) {
+        RCLCPP_ERROR(
+            get_logger(),
+            "save_layer_cake: no /tf_static parent for %s (need %s←%s from "
+            "ArUco at save time; bag will be missing this TF too)",
+            global_frame_.c_str(), map_frame_.c_str(), global_frame_.c_str());
+        return;
+      }
+      parent = it->second.first;
+      T_map_odom = it->second.second;
+    }
+    if (parent != map_frame_) {
+      RCLCPP_ERROR(
+          get_logger(),
+          "save_layer_cake: /tf_static child=%s has parent=%s, expected %s",
+          global_frame_.c_str(), parent.c_str(), map_frame_.c_str());
+      return;
+    }
+
+    namespace fs = std::filesystem;
+    const fs::path cake(layer_cake_path_);
+    const fs::path out =
+        cake.parent_path() / (cake.stem().string() + ".map_odom.yaml");
+    const Eigen::Vector3d t = T_map_odom.translation();
+    Eigen::Quaterniond q(T_map_odom.linear());
+    q.normalize();
+    try {
+      if (out.has_parent_path()) {
+        fs::create_directories(out.parent_path());
+      }
+      std::ofstream yaml(out);
+      if (!yaml) {
+        RCLCPP_ERROR(
+            get_logger(), "failed to write map←odom sidecar %s", out.c_str());
+        return;
+      }
+      yaml << std::setprecision(17);
+      yaml << "# map ← odom snapshot at LayerCake save (same TF as /tf_static).\n";
+      yaml << "parent_frame: " << map_frame_ << "\n";
+      yaml << "child_frame: " << global_frame_ << "\n";
+      yaml << "xyz: [" << t.x() << ", " << t.y() << ", " << t.z() << "]\n";
+      yaml << "xyzw: [" << q.x() << ", " << q.y() << ", " << q.z() << ", "
+           << q.w() << "]\n";
+      RCLCPP_INFO(
+          get_logger(),
+          "saved map←odom sidecar %s  xyz=[%.4f, %.4f, %.4f]",
+          out.c_str(), t.x(), t.y(), t.z());
+    } catch (const std::exception& ex) {
+      RCLCPP_ERROR(get_logger(), "map←odom sidecar failed: %s", ex.what());
     }
   }
 
@@ -2302,6 +2582,8 @@ class MappingNode : public rclcpp::Node {
 
   // Params
   std::string global_frame_;
+  std::string map_frame_{"map"};
+  bool save_map_odom_tf_{true};
   std::string base_frame_{"base_link"};
   std::string map_clearing_frame_;
   float voxel_size_{0.05f};
@@ -2345,6 +2627,8 @@ class MappingNode : public rclcpp::Node {
   std::string lidar_topic_;
   std::string people_mask_topic_;
   std::vector<std::string> camera_names_;
+  std::unordered_map<std::string, CamSensorConfig> cam_cfg_;
+  IntegratorSettings lidar_integ_;
   std::string depth_topic_template_;
   std::string depth_info_topic_template_;
   std::string color_topic_template_;
@@ -2358,9 +2642,6 @@ class MappingNode : public rclcpp::Node {
   bool use_lidar_motion_compensation_{false};
   double mapper_rate_hz_{20.0};
   double publish_map_rate_hz_{20.0};
-  double integrate_depth_rate_hz_{20.0};
-  double integrate_color_rate_hz_{20.0};
-  double integrate_lidar_rate_hz_{10.0};
   bool log_extract_timing_{false};
   bool publish_tsdf_color_mesh_{false};
   double tsdf_color_mesh_rate_hz_{1.0};

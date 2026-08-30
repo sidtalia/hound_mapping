@@ -55,36 +55,58 @@ nvblox::WeightingFunctionType parseWeightingMode(
   return W::kInverseSquareWeight;
 }
 
-void MapperCore::applyIntegratorParams()
+void MapperCore::applyTsdfSettings(const IntegratorSettings& s, bool lidar)
 {
-  const int ray_sub = std::max(1, config_.raycast_subsampling_factor);
-  const int color_sub =
-      std::max(1, config_.color_sphere_tracing_ray_subsampling_factor);
+  auto& integ =
+      lidar ? mapper_->lidar_tsdf_integrator() : mapper_->tsdf_integrator();
+  const int ray_sub = std::max(1, s.ray_subsampling_factor);
+  integ.max_integration_distance_m(s.max_integration_distance_m);
+  integ.truncation_distance_vox(s.truncation_distance_vox);
+  integ.max_weight(s.max_weight);
+  integ.weighting_function_type(s.weighting_function_type);
+  integ.invalid_depth_decay_factor(s.invalid_depth_decay_factor);
+  integ.view_calculator().raycast_subsampling_factor(
+      static_cast<unsigned int>(ray_sub));
+}
 
-  auto apply_tsdf = [&](nvblox::ProjectiveTsdfIntegrator& integ, float max_dist) {
-    integ.max_integration_distance_m(max_dist);
-    integ.truncation_distance_vox(config_.truncation_distance_vox);
-    integ.max_weight(config_.max_weight);
-    integ.weighting_function_type(config_.weighting_function_type);
-    integ.invalid_depth_decay_factor(config_.invalid_depth_decay_factor);
-    integ.view_calculator().raycast_subsampling_factor(
-        static_cast<unsigned int>(ray_sub));
-  };
-  apply_tsdf(mapper_->tsdf_integrator(), config_.max_integration_distance_m);
-  apply_tsdf(
-      mapper_->lidar_tsdf_integrator(), config_.lidar_max_integration_distance_m);
-
+void MapperCore::applyColorSettings(const IntegratorSettings& s)
+{
   auto& color = mapper_->color_integrator();
-  color.max_integration_distance_m(config_.color_max_integration_distance_m);
-  color.truncation_distance_vox(config_.truncation_distance_vox);
-  color.max_weight(config_.max_weight);
-  color.weighting_function_type(config_.weighting_function_type);
-  color.measurement_weight(config_.color_measurement_weight);
+  const int ray_sub = std::max(1, s.ray_subsampling_factor);
+  const int color_sub = std::max(1, s.sphere_tracing_ray_subsampling_factor);
+  color.max_integration_distance_m(s.color_max_integration_distance_m);
+  color.truncation_distance_vox(s.truncation_distance_vox);
+  color.max_weight(s.max_weight);
+  color.weighting_function_type(s.weighting_function_type);
+  color.measurement_weight(s.measurement_weight);
   color.sphere_tracing_ray_subsampling_factor(color_sub);
-  color.sphere_tracer().maximum_ray_length_m(
-      config_.color_sphere_tracer_max_ray_length_m);
+  color.sphere_tracer().maximum_ray_length_m(s.sphere_tracer_max_ray_length_m);
   color.view_calculator().raycast_subsampling_factor(
       static_cast<unsigned int>(ray_sub));
+}
+
+void MapperCore::applyIntegratorParams()
+{
+  IntegratorSettings cam;
+  cam.max_integration_distance_m = config_.max_integration_distance_m;
+  cam.truncation_distance_vox = config_.truncation_distance_vox;
+  cam.max_weight = config_.max_weight;
+  cam.weighting_function_type = config_.weighting_function_type;
+  cam.invalid_depth_decay_factor = config_.invalid_depth_decay_factor;
+  cam.ray_subsampling_factor = config_.raycast_subsampling_factor;
+  cam.measurement_weight = config_.color_measurement_weight;
+  cam.color_max_integration_distance_m = config_.color_max_integration_distance_m;
+  cam.sphere_tracer_max_ray_length_m =
+      config_.color_sphere_tracer_max_ray_length_m;
+  cam.sphere_tracing_ray_subsampling_factor =
+      config_.color_sphere_tracing_ray_subsampling_factor;
+
+  IntegratorSettings lidar = cam;
+  lidar.max_integration_distance_m = config_.lidar_max_integration_distance_m;
+
+  applyTsdfSettings(cam, false);
+  applyTsdfSettings(lidar, true);
+  applyColorSettings(cam);
 }
 
 MapperCore::MapperCore(const MapperConfig& config)

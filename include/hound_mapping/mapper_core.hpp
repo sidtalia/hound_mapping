@@ -33,6 +33,21 @@ struct MapperConfig {
   float color_measurement_weight = 0.8f;
 };
 
+/// Per-sensor projective settings applied immediately before integrate.
+struct IntegratorSettings {
+  float max_integration_distance_m = 15.0f;
+  float truncation_distance_vox = 4.0f;
+  float max_weight = 5.0f;
+  nvblox::WeightingFunctionType weighting_function_type =
+      nvblox::WeightingFunctionType::kInverseSquareWeight;
+  float invalid_depth_decay_factor = -1.0f;
+  int ray_subsampling_factor = 4;
+  float measurement_weight = 0.8f;
+  float color_max_integration_distance_m = 7.0f;
+  float sphere_tracer_max_ray_length_m = 15.0f;
+  int sphere_tracing_ray_subsampling_factor = 4;
+};
+
 /// ROS-free nvblox wrapper: integrate depth/lidar/color, radius-clear blocks.
 class MapperCore {
  public:
@@ -71,6 +86,10 @@ class MapperCore {
 
   /// Full color mesh from TSDF(+color) → PLY. Call after load or integrate.
   bool exportColorMeshPly(const std::string& ply_path);
+
+  /// Cheap: enum/float writes on the live integrator (no realloc).
+  void applyTsdfSettings(const IntegratorSettings& s, bool lidar);
+  void applyColorSettings(const IntegratorSettings& s);
 
   nvblox::Mapper& mapper() { return *mapper_; }
   const nvblox::Mapper& mapper() const { return *mapper_; }
