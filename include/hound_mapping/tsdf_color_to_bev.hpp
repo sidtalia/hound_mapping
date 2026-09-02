@@ -75,7 +75,7 @@ class TsdfColorToBevWorkspace {
 };
 
 /// Block-scatter TSDF → BEV: free/occ Z-bits → overhang floor → semantic cost.
-/// Optional prior: when TSDF has no surface, sample PriorBevGpu (loop1 fill).
+/// Optional prior: no live surface → elev+cost; live surface but no color → cost.
 void tsdf_color_to_bev(
     const nvblox::TsdfLayer& tsdf, const nvblox::ColorLayer& color,
     const TsdfColorToBevParams& params, TsdfColorToBevWorkspace* workspace,

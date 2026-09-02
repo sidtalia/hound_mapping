@@ -81,7 +81,7 @@ class ElevationCostExtractor {
  public:
   explicit ElevationCostExtractor(const ElevationCostConfig& config);
 
-  /// Optional GPU prior sampled in Finalize when live TSDF has no surface.
+  /// Optional GPU prior: no live surface → elev+cost; live surface, no color → cost.
   void setPrior(const PriorBevGpu* prior) { prior_ = prior; }
   const PriorBevGpu* prior() const { return prior_; }
 

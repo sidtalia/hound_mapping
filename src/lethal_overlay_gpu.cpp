@@ -1,13 +1,17 @@
 #include "hound_mapping/lethal_overlay_gpu.hpp"
 
-#include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <cuda_runtime.h>
+#include <opencv2/imgproc.hpp>
 
 namespace hound_mapping {
 namespace {
@@ -195,6 +199,143 @@ bool LethalOverlayGpu::loadYaml(
     return false;
   }
   return true;
+}
+
+bool LethalOverlayGpu::loadYamlPolygonsInGrid(
+    const std::string& yaml_path,
+    const std::vector<std::vector<cv::Point2f>>& polys_grid_xy,
+    const nvblox::CudaStream& cuda_stream, std::string* err)
+{
+  std::unordered_map<std::string, std::string> kv;
+  if (!parseSimpleYaml(yaml_path, &kv)) {
+    if (err) {
+      *err = "cannot read " + yaml_path;
+    }
+    return false;
+  }
+  auto getf = [&](const char* key, float* out) -> bool {
+    const auto it = kv.find(key);
+    if (it == kv.end() || it->second.empty()) {
+      if (err) {
+        *err = std::string("missing ") + key;
+      }
+      return false;
+    }
+    *out = std::stof(it->second);
+    return true;
+  };
+  auto geti = [&](const char* key, int* out) -> bool {
+    const auto it = kv.find(key);
+    if (it == kv.end() || it->second.empty()) {
+      if (err) {
+        *err = std::string("missing ") + key;
+      }
+      return false;
+    }
+    *out = std::stoi(it->second);
+    return true;
+  };
+  int w = 0;
+  int h = 0;
+  float res = 0.f;
+  float ox = 0.f;
+  float oy = 0.f;
+  if (!geti("width", &w) || !geti("height", &h) || !getf("resolution", &res) ||
+      !getf("origin_x", &ox) || !getf("origin_y", &oy)) {
+    return false;
+  }
+  if (w <= 0 || h <= 0 || !(res > 0.f)) {
+    if (err) {
+      *err = "invalid grid in " + yaml_path;
+    }
+    return false;
+  }
+  cv::Mat mask(h, w, CV_32FC1, cv::Scalar(1.f));
+  for (const auto& poly : polys_grid_xy) {
+    if (poly.size() < 3) {
+      continue;
+    }
+    std::vector<cv::Point> pix;
+    pix.reserve(poly.size());
+    for (const auto& p : poly) {
+      const int ix = static_cast<int>(std::floor((p.x - ox) / res));
+      const int iy = static_cast<int>(std::floor((p.y - oy) / res));
+      pix.emplace_back(ix, iy);
+    }
+    cv::fillPoly(mask, std::vector<std::vector<cv::Point>>{pix}, 0.f);
+  }
+  if (!upload(mask, ox, oy, res, 0.f, 0.f, 0.f, cuda_stream)) {
+    if (err) {
+      *err = "GPU upload failed";
+    }
+    return false;
+  }
+  return true;
+}
+
+std::string lethalYamlFrameId(const std::string& yaml_path)
+{
+  std::unordered_map<std::string, std::string> kv;
+  if (!parseSimpleYaml(yaml_path, &kv)) {
+    return "map";
+  }
+  const auto it = kv.find("frame_id");
+  if (it == kv.end() || it->second.empty()) {
+    return "map";
+  }
+  return it->second;
+}
+
+std::vector<std::vector<cv::Point2f>> parseLethalPolygons(
+    const std::string& yaml_path)
+{
+  std::ifstream in(yaml_path);
+  std::vector<std::vector<cv::Point2f>> out;
+  if (!in) {
+    return out;
+  }
+  std::string line;
+  bool in_polys = false;
+  const std::regex pair_re(
+      R"(\[\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*\])");
+  while (std::getline(in, line)) {
+    const auto hash = line.find('#');
+    if (hash != std::string::npos) {
+      line = line.substr(0, hash);
+    }
+    std::string stripped = trim(line);
+    if (!in_polys) {
+      if (stripped.rfind("polygons:", 0) == 0) {
+        in_polys = true;
+      }
+      continue;
+    }
+    if (stripped.empty()) {
+      continue;
+    }
+    if (stripped.find(':') != std::string::npos &&
+        stripped.rfind("polygons:", 0) != 0 && stripped[0] != '-') {
+      break;
+    }
+    const bool new_poly =
+        std::regex_search(line, std::regex(R"(^\s*-\s*-\s*\[)"));
+    std::smatch m;
+    std::string search = line;
+    bool any = false;
+    while (std::regex_search(search, m, pair_re)) {
+      cv::Point2f p(
+          std::stof(m[1].str()), std::stof(m[2].str()));
+      if (new_poly && !any) {
+        out.emplace_back();
+      } else if (out.empty()) {
+        out.emplace_back();
+      }
+      out.back().push_back(p);
+      any = true;
+      search = m.suffix().str();
+    }
+  }
+  return out;
 }
 
 }  // namespace hound_mapping

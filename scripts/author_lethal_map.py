@@ -229,14 +229,34 @@ def rasterize(
 
 def compose_rgb(
     cost: np.ndarray,
+    elev: np.ndarray,
     mask: np.ndarray,
     draft: list[list[float]],
     origin_x: float,
     origin_y: float,
     res: float,
 ) -> np.ndarray:
-    cost_u8 = np.clip(cost, 0.0, 255.0).astype(np.uint8)
-    rgb = np.stack([cost_u8, cost_u8, cost_u8], axis=-1)
+    # Height shade so a flat/white cost (unobserved≈252) still shows terrain.
+    e = elev.astype(np.float32)
+    finite = np.isfinite(e)
+    shade = np.full((*e.shape, 3), 28.0, dtype=np.float32)
+    if np.any(finite):
+        lo, hi = np.percentile(e[finite], [2.0, 98.0])
+        if hi <= lo + 1e-4:
+            hi = lo + 1.0
+        t = np.clip((e - lo) / (hi - lo), 0.0, 1.0)
+        shade[..., 0] = 35.0 + 90.0 * t
+        shade[..., 1] = 45.0 + 100.0 * t
+        shade[..., 2] = 55.0 + 80.0 * t
+        shade[~finite] = 28.0
+
+    # Cost: 0 lethal=red, 255 free=green. Mid/unobserved stays yellowish.
+    c = np.clip(cost.astype(np.float32), 0.0, 255.0) / 255.0
+    tint = np.empty((*c.shape, 3), dtype=np.float32)
+    tint[..., 0] = 40.0 + 200.0 * (1.0 - c)
+    tint[..., 1] = 30.0 + 200.0 * c
+    tint[..., 2] = 25.0
+    rgb = np.clip(0.4 * shade + 0.6 * tint, 0.0, 255.0).astype(np.uint8)
     lethal = mask <= 0.5
     rgb[lethal, 0] = 220
     rgb[lethal, 1] = 32
@@ -295,7 +315,8 @@ def write_lethal(
     header = (
         "# Lethal overlay. Same XY frame as the LayerCake BEV.\n"
         "# mask: 1 = free, 0 = lethal. Out-of-bounds treated as free.\n"
-        "# Authored by author_lethal_map.py (does not edit the LayerCake).\n"
+        "# polygons: map-frame vertices (RViz). Mask grid is LayerCake/odom XY.\n"
+        "# Authored by author_lethal_map.py / author_lethal_rviz.py.\n"
     )
     path.write_text(
         header + yaml.safe_dump(payload, sort_keys=False, default_flow_style=None),
@@ -306,9 +327,15 @@ def write_lethal(
 
 def _bind_clicks(server, on_event) -> None:
     scene = server.scene
+    # viser>=1: on_click() is a decorator. Older: on_click(cb).
     if hasattr(scene, "on_click"):
-        scene.on_click(on_event)
-        return
+        bind = scene.on_click
+        try:
+            bind(on_event)
+            return
+        except TypeError:
+            bind()(on_event)
+            return
     if hasattr(scene, "on_pointer_event"):
         scene.on_pointer_event(event_type="click")(on_event)
         return
@@ -390,6 +417,14 @@ def main(argv=None) -> int:
 
     elev_path = _ensure_elev(args.layercake, args.elev, nv)
     elev, cost, meta = _load_elev_yaml(elev_path)
+    finite = np.isfinite(elev)
+    print(
+        f"BEV elev finite={int(np.count_nonzero(finite))}/{elev.size} "
+        f"z=[{float(np.nanmin(elev)):.2f},{float(np.nanmax(elev)):.2f}] "
+        f"cost min/p50/max="
+        f"{float(np.min(cost)):.1f}/{float(np.median(cost)):.1f}/{float(np.max(cost)):.1f}",
+        flush=True,
+    )
     out = args.out
     if out is None:
         configured = str(nv.get("lethal_map_path") or "").strip()
@@ -431,7 +466,8 @@ def main(argv=None) -> int:
 
     state = {"draft": [], "polygons": list(polygons), "mask": mask}
     rgb0 = compose_rgb(
-        cost, mask, [], meta["origin_x"], meta["origin_y"], meta["resolution"]
+        cost, elev, mask, [], meta["origin_x"], meta["origin_y"],
+        meta["resolution"],
     )
     img_handle = _add_ground_image(server, "/bev", rgb0, meta)
     draft_cloud = server.scene.add_point_cloud(
@@ -456,6 +492,7 @@ def main(argv=None) -> int:
         )
         rgb = compose_rgb(
             cost,
+            elev,
             state["mask"],
             state["draft"],
             meta["origin_x"],

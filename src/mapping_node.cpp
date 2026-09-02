@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -229,6 +230,22 @@ bool colorToNvblox(
   return true;
 }
 
+/// 255 = project this pixel; 0 = semantic none (do not paint).
+void colorKeepMaskExcludingRgb(
+    const nvblox::ColorImage& color, uint8_t nr, uint8_t ng, uint8_t nb,
+    nvblox::MonoImage* mask)
+{
+  *mask = nvblox::MonoImage(
+      color.rows(), color.cols(), nvblox::MemoryType::kHost);
+  for (int r = 0; r < color.rows(); ++r) {
+    for (int c = 0; c < color.cols(); ++c) {
+      const nvblox::Color& px = color(r, c);
+      const bool skip = px.r() == nr && px.g() == ng && px.b() == nb;
+      (*mask)(r, c) = skip ? 0 : 255;
+    }
+  }
+}
+
 /// All-white RGB = fully traversable (cost stores L=255).
 bool whiteColorImage(
     int rows, int cols, nvblox::ColorImage* out)
@@ -412,6 +429,7 @@ class MappingNode : public rclcpp::Node {
         ? local_map_size_m_ * 0.5f
         : map_clearing_radius_m_;
     ec.unobserved_luminance = unobserved_luminance_;
+    ec.tsdf_weight_min = tsdf_weight_min_;
     ec.color_weight_min = color_weight_min_;
     ec.color_z_search_half_band_m = color_z_search_half_band_m_;
     ec.color_z_column_above_m = color_z_column_above_m_;
@@ -431,6 +449,12 @@ class MappingNode : public rclcpp::Node {
     maybeLoadPriorBev(ec);
     lethal_overlay_ = std::make_unique<LethalOverlayGpu>();
     maybeLoadLethalOverlay();
+    if (!lethal_map_path_.empty() &&
+        (lethal_overlay_ == nullptr || !lethal_overlay_->enabled))
+    {
+      lethal_overlay_retry_timer_ = create_wall_timer(
+          std::chrono::seconds(1), [this]() { maybeLoadLethalOverlay(); });
+    }
 
     lidar_ = nvblox::Lidar(
         lidar_width_, lidar_height_, lidar_min_valid_range_m_,
@@ -670,7 +694,7 @@ class MappingNode : public rclcpp::Node {
         "local_map=%.1fm clear_r=%.1fm mapper_hz=%.1f "
         "loop1=integrate+BEV every tick loop2=inpaint/publish extract_on_depth=%d "
         "odom=%s pose_buf=%.1fs base=%s "
-        "debug_semantic_all_traversable=%d "
+        "debug_semantic_all_traversable=%d skip_none=%d rgb=%u,%u,%u "
         "save_layer_cake=~/save_layer_cake path=%s "
         "lethal_map=%s "
         "map_clear=%s "
@@ -683,6 +707,10 @@ class MappingNode : public rclcpp::Node {
         map_clearing_radius_m_, mapper_rate_hz_, extract_on_depth_ ? 1 : 0,
         odom_topic_.c_str(), pose_buffer_s_, base_frame_.c_str(),
         debug_semantic_all_traversable_ ? 1 : 0,
+        skip_semantic_none_ ? 1 : 0,
+        static_cast<unsigned>(semantic_none_r_),
+        static_cast<unsigned>(semantic_none_g_),
+        static_cast<unsigned>(semantic_none_b_),
         layer_cake_path_.empty() ? "(unset)" : layer_cake_path_.c_str(),
         lethal_map_path_.empty() ? "(none/all-free)" : lethal_map_path_.c_str(),
         map_clear_topic_.c_str(),
@@ -951,6 +979,7 @@ class MappingNode : public rclcpp::Node {
     declare_parameter("inpaint_radius", 3);
     declare_parameter("elev_median_ksize", 5);
     declare_parameter("unobserved_luminance", 128.0);
+    declare_parameter("tsdf_weight_min", 0.001);
     declare_parameter("color_weight_min", 0.001);
     // 0 = auto (2 × voxel_size). Vertical band when sampling ColorVoxel at elev.
     declare_parameter("color_z_search_half_band_m", 0.0);
@@ -967,6 +996,10 @@ class MappingNode : public rclcpp::Node {
     // Debug: paint TSDF color all-white (semantic free in FOV).
     // Unobserved still uses unobserved_luminance (grey outside FOV).
     declare_parameter("debug_semantic_all_traversable", false);
+    declare_parameter("skip_semantic_none", true);
+    declare_parameter("semantic_none_r", 0);
+    declare_parameter("semantic_none_g", 0);
+    declare_parameter("semantic_none_b", 255);
     declare_parameter("use_lidar", true);
     declare_parameter("use_people_mask", false);
     // Drop bottom of depth image before integrate (0 = keep all, 0.5 = bottom half).
@@ -1095,6 +1128,8 @@ class MappingNode : public rclcpp::Node {
         static_cast<int>(get_parameter("elev_median_ksize").as_int());
     unobserved_luminance_ = static_cast<float>(
         get_parameter("unobserved_luminance").as_double());
+    tsdf_weight_min_ = static_cast<float>(
+        get_parameter("tsdf_weight_min").as_double());
     color_weight_min_ = static_cast<float>(
         get_parameter("color_weight_min").as_double());
     color_z_search_half_band_m_ = static_cast<float>(
@@ -1114,6 +1149,13 @@ class MappingNode : public rclcpp::Node {
     use_color_ = get_parameter("use_color").as_bool();
     debug_semantic_all_traversable_ =
         get_parameter("debug_semantic_all_traversable").as_bool();
+    skip_semantic_none_ = get_parameter("skip_semantic_none").as_bool();
+    semantic_none_r_ = static_cast<uint8_t>(std::clamp(
+        static_cast<int>(get_parameter("semantic_none_r").as_int()), 0, 255));
+    semantic_none_g_ = static_cast<uint8_t>(std::clamp(
+        static_cast<int>(get_parameter("semantic_none_g").as_int()), 0, 255));
+    semantic_none_b_ = static_cast<uint8_t>(std::clamp(
+        static_cast<int>(get_parameter("semantic_none_b").as_int()), 0, 255));
     use_lidar_ = get_parameter("use_lidar").as_bool();
     use_people_mask_ = get_parameter("use_people_mask").as_bool();
     depth_ignore_bottom_fraction_ =
@@ -1308,40 +1350,139 @@ class MappingNode : public rclcpp::Node {
 
   void maybeLoadLethalOverlay()
   {
-    finish_extractor_->setLethalOverlay(nullptr);
     if (lethal_map_path_.empty()) {
-      RCLCPP_INFO(
-          get_logger(), "lethal overlay: none (all free)");
+      finish_extractor_->setLethalOverlay(nullptr);
+      RCLCPP_INFO_ONCE(get_logger(), "lethal overlay: none (all free)");
       return;
     }
     if (!std::filesystem::exists(lethal_map_path_)) {
-      RCLCPP_ERROR(
-          get_logger(),
+      RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 5000,
           "lethal_map_path not found (%s); continuing with all-free overlay",
           lethal_map_path_.c_str());
       return;
     }
 
-    const float tx = static_cast<float>(prior_xyz_yaw_[0]);
-    const float ty = static_cast<float>(prior_xyz_yaw_[1]);
-    const float yaw = static_cast<float>(prior_xyz_yaw_[3]);
-    nvblox::CudaStreamOwning upload_stream;
-    std::string err;
-    if (!lethal_overlay_->loadYaml(
-            lethal_map_path_, tx, ty, yaw, upload_stream, &err)) {
-      RCLCPP_ERROR(
-          get_logger(), "lethal overlay load failed: %s", err.c_str());
-      lethal_overlay_->clear();
+    if (!lethal_mask_loaded_) {
+      nvblox::CudaStreamOwning upload_stream;
+      std::string err;
+      lethal_overlay_frame_ = lethalYamlFrameId(lethal_map_path_);
+      auto polys = parseLethalPolygons(lethal_map_path_);
+      bool ok = false;
+      if (!polys.empty()) {
+        ok = lethal_overlay_->loadYamlPolygonsInGrid(
+            lethal_map_path_, polys, upload_stream, &err);
+      } else {
+        ok = lethal_overlay_->loadYaml(
+            lethal_map_path_, 0.f, 0.f, 0.f, upload_stream, &err);
+      }
+      if (!ok) {
+        RCLCPP_ERROR(
+            get_logger(), "lethal overlay load failed: %s", err.c_str());
+        lethal_overlay_->clear();
+        return;
+      }
+      lethal_mask_loaded_ = true;
+      RCLCPP_INFO(
+          get_logger(),
+          "lethal overlay mask on GPU: %dx%d @ %.3fm origin=(%.2f,%.2f) "
+          "frame=%s from %s",
+          lethal_overlay_->width, lethal_overlay_->height,
+          lethal_overlay_->resolution, lethal_overlay_->origin_x,
+          lethal_overlay_->origin_y,
+          lethal_overlay_frame_.empty() ? "(empty)" : lethal_overlay_frame_.c_str(),
+          lethal_map_path_.c_str());
+    }
+
+    if (!applyLethalOverlayPose()) {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "lethal overlay: waiting for static TF %s ← %s",
+          global_frame_.c_str(),
+          lethal_overlay_frame_.empty() ? "?" : lethal_overlay_frame_.c_str());
+      finish_extractor_->setLethalOverlay(nullptr);
       return;
     }
     finish_extractor_->setLethalOverlay(lethal_overlay_.get());
-    RCLCPP_INFO(
-        get_logger(),
-        "lethal overlay ready: %dx%d @ %.3fm origin=(%.2f,%.2f) "
-        "T_global_overlay=[%.2f,%.2f,yaw=%.3f] from %s",
-        lethal_overlay_->width, lethal_overlay_->height,
-        lethal_overlay_->resolution, lethal_overlay_->origin_x,
-        lethal_overlay_->origin_y, tx, ty, yaw, lethal_map_path_.c_str());
+    if (lethal_overlay_retry_timer_) {
+      lethal_overlay_retry_timer_->cancel();
+    }
+  }
+
+  /** Refresh overlay SE2 from /tf_static. Mask stays in yaml frame_id. */
+  bool applyLethalOverlayPose()
+  {
+    if (!lethal_mask_loaded_ || lethal_overlay_ == nullptr) {
+      return false;
+    }
+    const std::string& frame = lethal_overlay_frame_;
+    if (frame.empty() || frame == global_frame_) {
+      lethal_overlay_->tx = static_cast<float>(prior_xyz_yaw_[0]);
+      lethal_overlay_->ty = static_cast<float>(prior_xyz_yaw_[1]);
+      lethal_overlay_->yaw = static_cast<float>(prior_xyz_yaw_[3]);
+      lethal_overlay_->enabled = true;
+      return true;
+    }
+    Eigen::Isometry3d T_global_overlay = Eigen::Isometry3d::Identity();
+    if (!lookupStaticTf(global_frame_, frame, &T_global_overlay)) {
+      lethal_overlay_->enabled = false;
+      return false;
+    }
+    const Eigen::Vector3d t = T_global_overlay.translation();
+    const Eigen::Matrix3d R = T_global_overlay.linear();
+    lethal_overlay_->tx = static_cast<float>(t.x());
+    lethal_overlay_->ty = static_cast<float>(t.y());
+    lethal_overlay_->yaw = static_cast<float>(std::atan2(R(1, 0), R(0, 0)));
+    lethal_overlay_->enabled = true;
+    RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "lethal overlay T_%s_%s SE2 tx=%.3f ty=%.3f yaw=%.3f rad",
+        global_frame_.c_str(), frame.c_str(),
+        lethal_overlay_->tx, lethal_overlay_->ty, lethal_overlay_->yaw);
+    return true;
+  }
+
+  bool lookupStaticTf(
+      const std::string& target, const std::string& source,
+      Eigen::Isometry3d* T_target_source)
+  {
+    if (T_target_source == nullptr) {
+      return false;
+    }
+    if (target == source) {
+      *T_target_source = Eigen::Isometry3d::Identity();
+      return true;
+    }
+    auto walk = [this](
+                    const std::string& from, const std::string& to,
+                    Eigen::Isometry3d* T_to_from) -> bool {
+      Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+      std::string cur = from;
+      std::lock_guard<std::mutex> lock(static_tf_mu_);
+      for (int hops = 0; hops < 16; ++hops) {
+        if (cur == to) {
+          *T_to_from = T;
+          return true;
+        }
+        const auto it = parent_of_.find(cur);
+        if (it == parent_of_.end()) {
+          return false;
+        }
+        T = it->second.second * T;
+        cur = it->second.first;
+      }
+      return false;
+    };
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    if (walk(source, target, &T)) {
+      *T_target_source = T;
+      return true;
+    }
+    if (walk(target, source, &T)) {
+      *T_target_source = T.inverse();
+      return true;
+    }
+    return false;
   }
 
   void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg)
@@ -1365,12 +1506,22 @@ class MappingNode : public rclcpp::Node {
 
   void onTfStatic(const tf2_msgs::msg::TFMessage& msg)
   {
-    std::lock_guard<std::mutex> lock(static_tf_mu_);
-    for (const auto& tf : msg.transforms) {
-      parent_of_[tf.child_frame_id] =
-          {tf.header.frame_id, isometryFromTf(tf.transform)};
+    {
+      std::lock_guard<std::mutex> lock(static_tf_mu_);
+      for (const auto& tf : msg.transforms) {
+        parent_of_[tf.child_frame_id] =
+            {tf.header.frame_id, isometryFromTf(tf.transform)};
+      }
+      T_base_cache_.clear();
     }
-    T_base_cache_.clear();
+    if (lethal_mask_loaded_) {
+      if (applyLethalOverlayPose()) {
+        finish_extractor_->setLethalOverlay(lethal_overlay_.get());
+        if (lethal_overlay_retry_timer_) {
+          lethal_overlay_retry_timer_->cancel();
+        }
+      }
+    }
   }
 
   bool T_base_of(const std::string& frame, Eigen::Isometry3d* T_base_frame)
@@ -1685,7 +1836,15 @@ class MappingNode : public rclcpp::Node {
         }
         if (ok) {
           mapper_->applyColorSettings(pc.slot->integ);
-          mapper_->integrateColor(color, T_L_C, *pc.color_cam);
+          std::optional<nvblox::MonoImage> keep;
+          if (skip_semantic_none_ && !debug_semantic_all_traversable_) {
+            nvblox::MonoImage mask(nvblox::MemoryType::kHost);
+            colorKeepMaskExcludingRgb(
+                color, semantic_none_r_, semantic_none_g_,
+                semantic_none_b_, &mask);
+            keep = std::move(mask);
+          }
+          mapper_->integrateColor(color, T_L_C, *pc.color_cam, keep);
           pc.slot->last_color_ns = ns;
           if (stamp_for_map.nanoseconds() == 0) {
             stamp_for_map = pc.color_msg->header.stamp;
@@ -1780,6 +1939,9 @@ class MappingNode : public rclcpp::Node {
       using Clock = std::chrono::steady_clock;
       const auto t0 = Clock::now();
       ExtractTiming fin;
+      if (applyLethalOverlayPose()) {
+        finish_extractor_->setLethalOverlay(lethal_overlay_.get());
+      }
       finish_extractor_->finishLocalMap(&job.maps, &fin);
       const double finish_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -2653,6 +2815,7 @@ class MappingNode : public rclcpp::Node {
   int inpaint_radius_{3};
   int elev_median_ksize_{5};
   float unobserved_luminance_{128.f};
+  float tsdf_weight_min_{1e-3f};
   float color_weight_min_{1e-3f};
   float color_z_search_half_band_m_{0.f};
   float color_z_column_above_m_{0.f};
@@ -2663,6 +2826,10 @@ class MappingNode : public rclcpp::Node {
   bool use_depth_{true};
   bool use_color_{true};
   bool debug_semantic_all_traversable_{false};
+  bool skip_semantic_none_{true};
+  uint8_t semantic_none_r_{0};
+  uint8_t semantic_none_g_{0};
+  uint8_t semantic_none_b_{255};
   bool use_lidar_{true};
   bool use_people_mask_{false};
   double depth_ignore_bottom_fraction_{0.0};
@@ -2711,6 +2878,8 @@ class MappingNode : public rclcpp::Node {
   std::vector<double> prior_xyz_yaw_{0.0, 0.0, 0.0, 0.0};
   bool prior_fill_enabled_{true};
   std::string lethal_map_path_;
+  std::string lethal_overlay_frame_;
+  bool lethal_mask_loaded_{false};
   double tf_lookup_timeout_s_{0.05};
   bool tf_fallback_to_latest_{true};
   std::string odom_topic_{"/ekf/odometry"};
@@ -2721,6 +2890,7 @@ class MappingNode : public rclcpp::Node {
   std::unique_ptr<ElevationCostExtractor> finish_extractor_;
   std::unique_ptr<PriorBevGpu> prior_bev_;
   std::unique_ptr<LethalOverlayGpu> lethal_overlay_;
+  rclcpp::TimerBase::SharedPtr lethal_overlay_retry_timer_;
   nvblox::Lidar lidar_;
   std::shared_ptr<nvblox::CudaStream> lidar_stream_;
 

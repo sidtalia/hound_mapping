@@ -116,6 +116,8 @@ install(PROGRAMS
   scripts/generate_rail_dataset.py
   scripts/viser_rail_compare.py
   scripts/author_lethal_map.py
+  scripts/author_lethal_rviz.py
+  scripts/show_mesh.py
   scripts/smoke_multicam_rail.sh
   DESTINATION lib/${PROJECT_NAME}
 )

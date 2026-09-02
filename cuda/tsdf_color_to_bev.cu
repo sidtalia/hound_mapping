@@ -56,6 +56,41 @@ __device__ inline bool test_bit(
   return (words[cell * n_words + w] >> (iz & 31)) & 1u;
 }
 
+__device__ inline bool samplePriorBev(
+    float x, float y, const float* prior_elev, const float* prior_cost,
+    const uint8_t* prior_obs, float prior_ox, float prior_oy, float prior_res,
+    int prior_w, int prior_h, float prior_tx, float prior_ty, float prior_tz,
+    float prior_yaw, float* out_elev, float* out_cost)
+{
+  if (!prior_elev || !prior_cost || !prior_obs || prior_w <= 0 ||
+      prior_h <= 0 || prior_res <= 0.f)
+  {
+    return false;
+  }
+  const float dx = x - prior_tx;
+  const float dy = y - prior_ty;
+  const float c = cosf(-prior_yaw);
+  const float s = sinf(-prior_yaw);
+  const float xp = c * dx - s * dy;
+  const float yp = s * dx + c * dy;
+  const int pix = static_cast<int>(floorf((xp - prior_ox) / prior_res));
+  const int piy = static_cast<int>(floorf((yp - prior_oy) / prior_res));
+  if (pix < 0 || piy < 0 || pix >= prior_w || piy >= prior_h) {
+    return false;
+  }
+  const int pcell = piy * prior_w + pix;
+  if (prior_obs[pcell] == 0) {
+    return false;
+  }
+  if (out_elev != nullptr) {
+    *out_elev = prior_elev[pcell] + prior_tz;
+  }
+  if (out_cost != nullptr) {
+    *out_cost = clampf(prior_cost[pcell], 0.f, 255.f);
+  }
+  return true;
+}
+
 __device__ inline float colorLuminance(const nvblox::Color& c) {
   return 0.299f * static_cast<float>(c.r()) +
          0.587f * static_cast<float>(c.g()) +
@@ -249,12 +284,18 @@ __global__ void finalize_from_bits_kernel(
   // Cost stored as free-ness luminance [0,255]: 255 white/free, 0 black/lethal.
   float out_cost = unobserved_luminance;
   uint8_t out_obs = 0;
+  const float x = origin_x + (static_cast<float>(ix) + 0.5f) * resolution;
+  const float y = origin_y + (static_cast<float>(iy) + 0.5f) * resolution;
+  const bool can_prior =
+      prior_enabled && prior_elev && prior_cost && prior_obs && prior_w > 0 &&
+      prior_h > 0 && prior_res > 0.f;
 
   if (found) {
     out_elev = surface_z;
     out_obs = 255;
     // Color of the floor bin (and free-side bin just above, where mesh color
     // usually lives). Not the whole column — that mixed ceilings/people/floor.
+    bool have_color = false;
     if (lum_iz_u != nullptr && floor_iz >= 0) {
       uint32_t Lcode = lum_iz_u[cell * nz + floor_iz];
       if (floor_iz > 0) {
@@ -262,34 +303,38 @@ __global__ void finalize_from_bits_kernel(
       }
       if (Lcode <= 255u) {
         L = static_cast<float>(Lcode);
+        have_color = true;
       }
     }
-    out_cost = L;
-  } else if (
-      prior_enabled && prior_elev && prior_cost && prior_obs && prior_w > 0 &&
-      prior_h > 0 && prior_res > 0.f) {
-    // Live cell center in global → prior frame: R(-yaw)*(p - t).
-    const float x = origin_x + (static_cast<float>(ix) + 0.5f) * resolution;
-    const float y = origin_y + (static_cast<float>(iy) + 0.5f) * resolution;
-    const float dx = x - prior_tx;
-    const float dy = y - prior_ty;
-    const float c = cosf(-prior_yaw);
-    const float s = sinf(-prior_yaw);
-    const float xp = c * dx - s * dy;
-    const float yp = s * dx + c * dy;
-    const int pix =
-        static_cast<int>(floorf((xp - prior_ox) / prior_res));
-    const int piy =
-        static_cast<int>(floorf((yp - prior_oy) / prior_res));
-    if (pix >= 0 && piy >= 0 && pix < prior_w && piy < prior_h) {
-      const int pcell = piy * prior_w + pix;
-      if (prior_obs[pcell] != 0) {
-        out_elev = prior_elev[pcell] + prior_tz;
-        // Prior cost expected as free-ness [0,255] (same as live).
-        out_cost = clampf(prior_cost[pcell], 0.f, 255.f);
-        L = out_cost;
-        out_obs = 255;
+    if (have_color) {
+      out_cost = L;
+    } else if (can_prior) {
+      float prior_c = unobserved_luminance;
+      if (samplePriorBev(
+              x, y, prior_elev, prior_cost, prior_obs, prior_ox, prior_oy,
+              prior_res, prior_w, prior_h, prior_tx, prior_ty, prior_tz,
+              prior_yaw, nullptr, &prior_c))
+      {
+        out_cost = prior_c;
+        L = prior_c;
+      } else {
+        out_cost = L;
       }
+    } else {
+      out_cost = L;
+    }
+  } else if (can_prior) {
+    float prior_e = unknown_elev_z;
+    float prior_c = unobserved_luminance;
+    if (samplePriorBev(
+            x, y, prior_elev, prior_cost, prior_obs, prior_ox, prior_oy,
+            prior_res, prior_w, prior_h, prior_tx, prior_ty, prior_tz,
+            prior_yaw, &prior_e, &prior_c))
+    {
+      out_elev = prior_e;
+      out_cost = prior_c;
+      L = prior_c;
+      out_obs = 255;
     }
   }
 

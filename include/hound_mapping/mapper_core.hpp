@@ -70,7 +70,8 @@ class MapperCore {
 
   void integrateColor(
       const nvblox::ColorImage& color, const nvblox::Transform& T_L_C,
-      const nvblox::Camera& camera);
+      const nvblox::Camera& camera,
+      const std::optional<nvblox::MonoImage>& keep_mask = std::nullopt);
 
   void clearOutsideRadius(const nvblox::Vector3f& center_L);
 

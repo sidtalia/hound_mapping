@@ -151,9 +151,21 @@ void MapperCore::integrateLidar(
 
 void MapperCore::integrateColor(
     const nvblox::ColorImage& color, const nvblox::Transform& T_L_C,
-    const nvblox::Camera& camera)
+    const nvblox::Camera& camera,
+    const std::optional<nvblox::MonoImage>& keep_mask)
 {
-  mapper_->integrateColor(color, T_L_C, camera);
+  if (keep_mask.has_value() && keep_mask->rows() == color.rows() &&
+      keep_mask->cols() == color.cols())
+  {
+    const nvblox::MonoImage& mask = keep_mask.value();
+    std::optional<nvblox::ImageView<const uint8_t>> mask_view{
+        nvblox::MonoImageConstView(mask)};
+    nvblox::MaskedColorImageConstView masked(
+        color, mask_view, nvblox::MaskMode::kNonInverted);
+    mapper_->integrateColor(masked, T_L_C, camera);
+  } else {
+    mapper_->integrateColor(color, T_L_C, camera);
+  }
 }
 
 void MapperCore::clearOutsideRadius(const nvblox::Vector3f& center_L)
