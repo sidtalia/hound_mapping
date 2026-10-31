@@ -5,6 +5,9 @@
 #include <nvblox/core/cuda_stream.h>
 #include <nvblox/map/common_names.h>
 
+#include "hound_mapping/lethal_overlay_gpu.hpp"
+#include "hound_mapping/prior_bev_gpu.hpp"
+
 namespace hound_mapping {
 
 struct TsdfColorToBevParams {
@@ -22,9 +25,20 @@ struct TsdfColorToBevParams {
   float robot_height_m = 0.4f;
   /// Min TSDF weight to treat a voxel as observed.
   float tsdf_weight_min = 1e-3f;
-  /// Luminance written when ColorVoxel missing / low weight (0 → lethal cost).
-  float unobserved_luminance = 0.f;
+  /// BEV treats distance <= this as occupied (meters). 0 = strict TSDF ≤0.
+  /// Slightly positive values pull near-surface free-side voxels into the
+  /// floor finder (fixes elev holes from projective lidar one-sided TSDF).
+  float bev_occ_tsdf_max_m = 0.f;
+  /// Luminance/cost when ColorVoxel missing or no floor (0–255, from SSoT
+  /// ``unobserved_luminance``). Typical: 128 = unknown gray, 255 = treat as free.
+  float unobserved_luminance = 128.f;
   float color_weight_min = 1e-3f;
+  /// Vertical half-band (m) below elev floor when sampling ColorVoxel.
+  /// 0 → auto (2 × TSDF voxel size).
+  float color_z_search_half_band_m = 0.f;
+  /// Search this far above elev for darker (lethal) color in the column.
+  /// 0 → full BEV Z span (z_max - z_min). People/walls paint above the floor.
+  float color_z_column_above_m = 0.f;
   /// Unused in tsdf_color_to_bev; passed through for callers that also slope.
   float lethal_slope_deg = 60.f;
 };
@@ -49,28 +63,33 @@ class TsdfColorToBevWorkspace {
   /// Per-cell Z occupancy / free bitsets (n_words = ceil(nz/32) each).
   uint32_t* occ_bits_d = nullptr;
   uint32_t* free_bits_d = nullptr;
+  /// Per-cell, per-Z-bin min luminance (0–255). 0xFFFFFFFF = no color in bin.
+  /// Indexed [cell * nz + iz]. Used when that iz is chosen as the floor.
+  uint32_t* lum_iz_u_d = nullptr;
   nvblox::Index3D* block_indices_d = nullptr;
 
   int cell_capacity = 0;
   int bit_words = 0;
+  int nz_capacity = 0;
   int block_capacity = 0;
 };
 
 /// Block-scatter TSDF → BEV: free/occ Z-bits → overhang floor → semantic cost.
-/// Does not compute normals/slope (call apply_slope_normals_cost after optional
-/// elev inpaint).
+/// Optional prior: no live surface → elev+cost; live surface but no color → cost.
 void tsdf_color_to_bev(
     const nvblox::TsdfLayer& tsdf, const nvblox::ColorLayer& color,
     const TsdfColorToBevParams& params, TsdfColorToBevWorkspace* workspace,
     float* elev_host, float* lum_host, float* cost_host,
-    uint8_t* observed_host, const nvblox::CudaStream& cuda_stream);
+    uint8_t* observed_host, const nvblox::CudaStream& cuda_stream,
+    const PriorBevGpu* prior = nullptr);
 
-/// GPU normals from elev + slope OR into cost. Unobserved cells get cost =
-/// slope_lethal only (semantic lethality cleared after elev inpaint).
+/// GPU normals from elev + slope forces free-ness cost to 0 when lethal.
+/// Optional overlay: after slope, sample LethalOverlayGpu and AND (0=lethal).
 void apply_slope_normals_cost(
     TsdfColorToBevWorkspace* workspace, int width, int height, float resolution,
     float lethal_slope_deg, float* elev_host, float* cost_host,
     const uint8_t* observed_host, float* normal_host,
-    const nvblox::CudaStream& cuda_stream);
+    const nvblox::CudaStream& cuda_stream, float origin_x = 0.f,
+    float origin_y = 0.f, const LethalOverlayGpu* overlay = nullptr);
 
 }  // namespace hound_mapping

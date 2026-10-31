@@ -102,6 +102,14 @@ def camera_pose_world(
     return t, R_wo
 
 
+# Default multi-cam body yaw offsets (rad) relative to rail heading.
+DEFAULT_VIEW_YAW_OFFSETS = {
+    "front": 0.0,
+    "left": np.deg2rad(90.0),
+    "right": np.deg2rad(-90.0),
+}
+
+
 def render_depth_trav(
     elev: np.ndarray,
     cost: np.ndarray,
@@ -111,6 +119,7 @@ def render_depth_trav(
     yaw: float,
     cam: CameraModel,
     n_steps: int = 64,
+    yaw_offset: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Render depth (meters, Z in optical) and RGB traversability.
 
@@ -122,7 +131,7 @@ def render_depth_trav(
     t, R_wo = camera_pose_world(
         x,
         y,
-        yaw,
+        yaw + float(yaw_offset),
         elev,
         map_res,
         cam.cam_height_m,
@@ -169,6 +178,26 @@ def render_depth_trav(
     T[:3, :3] = R_wo
     T[:3, 3] = t
     return depth, trav, T
+
+
+def synthetic_stereo_ir(trav_rgb: np.ndarray, depth: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Fake stereo IR for capture-contract completeness (not for cuVSLAM smoke).
+
+    Left = luminance of trav; right = left with a tiny horizontal shift where depth is valid.
+    """
+    if trav_rgb.ndim == 3:
+        left = (
+            0.299 * trav_rgb[..., 0].astype(np.float32)
+            + 0.587 * trav_rgb[..., 1].astype(np.float32)
+            + 0.114 * trav_rgb[..., 2].astype(np.float32)
+        ).astype(np.uint8)
+    else:
+        left = trav_rgb.astype(np.uint8)
+    right = np.roll(left, shift=2, axis=1)
+    right[:, :2] = left[:, :2]
+    right[depth <= 0] = 0
+    left[depth <= 0] = 0
+    return left, right
 
 
 def densify_path(

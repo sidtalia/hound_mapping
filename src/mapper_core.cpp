@@ -1,8 +1,113 @@
 #include "hound_mapping/mapper_core.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <utility>
 
 namespace hound_mapping {
+
+namespace {
+
+std::string normalizeWeightingName(std::string s)
+{
+  for (char& c : s) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (c == '-' || c == ' ') {
+      c = '_';
+    }
+  }
+  return s;
+}
+
+}  // namespace
+
+nvblox::WeightingFunctionType parseWeightingMode(
+    const std::string& raw, bool* ok)
+{
+  using W = nvblox::WeightingFunctionType;
+  const std::string s = normalizeWeightingName(raw);
+  if (ok) {
+    *ok = true;
+  }
+  if (s == "constant" || s == "0" || s == "kconstantweight") {
+    return W::kConstantWeight;
+  }
+  if (s == "constant_dropoff" || s == "1" || s == "kconstantdropoffweight") {
+    return W::kConstantDropoffWeight;
+  }
+  if (s == "inverse_square" || s == "2" || s == "kinversesquareweight") {
+    return W::kInverseSquareWeight;
+  }
+  if (s == "inverse_square_dropoff" || s == "3" ||
+      s == "kinversesquaredropoffweight") {
+    return W::kInverseSquareDropoffWeight;
+  }
+  if (s == "inverse_square_tsdf_distance_penalty" || s == "4" ||
+      s == "kinversesquaretsdfdistancepenalty") {
+    return W::kInverseSquareTsdfDistancePenalty;
+  }
+  if (s == "linear_with_max" || s == "5" || s == "klinearwithmax") {
+    return W::kLinearWithMax;
+  }
+  if (ok) {
+    *ok = false;
+  }
+  return W::kInverseSquareWeight;
+}
+
+void MapperCore::applyTsdfSettings(const IntegratorSettings& s, bool lidar)
+{
+  auto& integ =
+      lidar ? mapper_->lidar_tsdf_integrator() : mapper_->tsdf_integrator();
+  const int ray_sub = std::max(1, s.ray_subsampling_factor);
+  integ.max_integration_distance_m(s.max_integration_distance_m);
+  integ.truncation_distance_vox(s.truncation_distance_vox);
+  integ.max_weight(s.max_weight);
+  integ.weighting_function_type(s.weighting_function_type);
+  integ.invalid_depth_decay_factor(s.invalid_depth_decay_factor);
+  integ.view_calculator().raycast_subsampling_factor(
+      static_cast<unsigned int>(ray_sub));
+}
+
+void MapperCore::applyColorSettings(const IntegratorSettings& s)
+{
+  auto& color = mapper_->color_integrator();
+  const int ray_sub = std::max(1, s.ray_subsampling_factor);
+  const int color_sub = std::max(1, s.sphere_tracing_ray_subsampling_factor);
+  color.max_integration_distance_m(s.color_max_integration_distance_m);
+  color.truncation_distance_vox(s.truncation_distance_vox);
+  color.max_weight(s.max_weight);
+  color.weighting_function_type(s.weighting_function_type);
+  color.measurement_weight(s.measurement_weight);
+  color.sphere_tracing_ray_subsampling_factor(color_sub);
+  color.sphere_tracer().maximum_ray_length_m(s.sphere_tracer_max_ray_length_m);
+  color.view_calculator().raycast_subsampling_factor(
+      static_cast<unsigned int>(ray_sub));
+}
+
+void MapperCore::applyIntegratorParams()
+{
+  IntegratorSettings cam;
+  cam.max_integration_distance_m = config_.max_integration_distance_m;
+  cam.truncation_distance_vox = config_.truncation_distance_vox;
+  cam.max_weight = config_.max_weight;
+  cam.weighting_function_type = config_.weighting_function_type;
+  cam.invalid_depth_decay_factor = config_.invalid_depth_decay_factor;
+  cam.ray_subsampling_factor = config_.raycast_subsampling_factor;
+  cam.measurement_weight = config_.color_measurement_weight;
+  cam.color_max_integration_distance_m = config_.color_max_integration_distance_m;
+  cam.sphere_tracer_max_ray_length_m =
+      config_.color_sphere_tracer_max_ray_length_m;
+  cam.sphere_tracing_ray_subsampling_factor =
+      config_.color_sphere_tracing_ray_subsampling_factor;
+
+  IntegratorSettings lidar = cam;
+  lidar.max_integration_distance_m = config_.lidar_max_integration_distance_m;
+
+  applyTsdfSettings(cam, false);
+  applyTsdfSettings(lidar, true);
+  applyColorSettings(cam);
+}
 
 MapperCore::MapperCore(const MapperConfig& config)
 : config_(config),
@@ -12,11 +117,7 @@ MapperCore::MapperCore(const MapperConfig& config)
   mapper_ = std::make_unique<nvblox::Mapper>(
       config_.voxel_size_m, pool_params, nvblox::ProjectiveLayerType::kTsdf,
       cuda_stream_);
-
-  mapper_->tsdf_integrator().max_integration_distance_m(
-      config_.max_integration_distance_m);
-  mapper_->lidar_tsdf_integrator().max_integration_distance_m(
-      config_.lidar_max_integration_distance_m);
+  applyIntegratorParams();
 }
 
 void MapperCore::integrateDepth(
@@ -39,17 +140,32 @@ void MapperCore::integrateDepth(
 
 void MapperCore::integrateLidar(
     const nvblox::Pointcloud& cloud, const nvblox::Transform& T_L_S,
-    const nvblox::Lidar& lidar, bool motion_compensation)
+    const nvblox::Lidar& lidar, bool motion_compensation,
+    const std::optional<nvblox::Transform>& T_L_S_scan_end,
+    const std::optional<nvblox::Time>& scan_duration_ms)
 {
   mapper_->integrateDepth(
-      cloud, T_L_S, lidar, motion_compensation, std::nullopt, std::nullopt);
+      cloud, T_L_S, lidar, motion_compensation, T_L_S_scan_end,
+      scan_duration_ms);
 }
 
 void MapperCore::integrateColor(
     const nvblox::ColorImage& color, const nvblox::Transform& T_L_C,
-    const nvblox::Camera& camera)
+    const nvblox::Camera& camera,
+    const std::optional<nvblox::MonoImage>& keep_mask)
 {
-  mapper_->integrateColor(color, T_L_C, camera);
+  if (keep_mask.has_value() && keep_mask->rows() == color.rows() &&
+      keep_mask->cols() == color.cols())
+  {
+    const nvblox::MonoImage& mask = keep_mask.value();
+    std::optional<nvblox::ImageView<const uint8_t>> mask_view{
+        nvblox::MonoImageConstView(mask)};
+    nvblox::MaskedColorImageConstView masked(
+        color, mask_view, nvblox::MaskMode::kNonInverted);
+    mapper_->integrateColor(masked, T_L_C, camera);
+  } else {
+    mapper_->integrateColor(color, T_L_C, camera);
+  }
 }
 
 void MapperCore::clearOutsideRadius(const nvblox::Vector3f& center_L)
@@ -57,6 +173,32 @@ void MapperCore::clearOutsideRadius(const nvblox::Vector3f& center_L)
   if (config_.map_clearing_radius_m > 0.f) {
     mapper_->clearOutsideRadius(center_L, config_.map_clearing_radius_m);
   }
+}
+
+void MapperCore::clear()
+{
+  nvblox::BlockMemoryPoolParams pool_params(nvblox::MemoryType::kDevice);
+  mapper_ = std::make_unique<nvblox::Mapper>(
+      config_.voxel_size_m, pool_params, nvblox::ProjectiveLayerType::kTsdf,
+      cuda_stream_);
+  applyIntegratorParams();
+}
+
+bool MapperCore::saveLayerCake(const std::string& path) const
+{
+  return mapper_->saveLayerCake(path);
+}
+
+bool MapperCore::loadLayerCake(const std::string& path)
+{
+  nvblox::BlockMemoryPoolParams pool_params(nvblox::MemoryType::kDevice);
+  return mapper_->loadMap(path, pool_params);
+}
+
+bool MapperCore::exportColorMeshPly(const std::string& ply_path)
+{
+  mapper_->updateColorMesh(nvblox::UpdateFullLayer::kYes);
+  return mapper_->saveColorMeshAsPly(ply_path);
 }
 
 }  // namespace hound_mapping

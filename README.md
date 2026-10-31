@@ -3,6 +3,10 @@
 nvblox **TSDF** integrate + GPU **TSDF→BEV** elevation / cost / normals for HOUND.
 Publishes `LocalMap` (robot-centered, odom axes — not yaw-rotated). No ESDF layer.
 
+## Known issue: color projection
+
+Projective color into the TSDF often looks wrong (missing / magenta / misaligned on occupied voxels). Root cause is unclear (`camera_info`, TF timing, integrate vs LiDAR surface, QoS, …). Treat `~/tsdf_voxels` color as suspect until investigated under controlled replay. Noted in `hound_core/config/SSoT.yaml` (`nvblox`) and `hound_core/docs/context.md`.
+
 ## Hotpath
 
 ```
@@ -45,6 +49,13 @@ ros2 run hound_mapping smoke_rail_mapper --ros-args \
   -p dataset:=/root/colcon_ws/src/hound_mapping/data/rail_sim/race-2
 ```
 
+Multi-cam (front/left/right) offline smoke:
+
+```bash
+bash scripts/smoke_multicam_rail.sh
+# or: generate_rail_dataset.py --multicam --out data/rail_sim/race-2_multicam
+```
+
 Viser compare:
 
 ```bash
@@ -55,6 +66,6 @@ python3 scripts/viser_rail_compare.py --dataset data/rail_sim/race-2 --port 8081
 
 | Topic | Type | Notes |
 |-------|------|--------|
-| `~/local_map` | `LocalMap` | elev, costmap `[0,1]`, normals, observed |
+| `~/local_map` | `LocalMap` | elev + costmap free-ness `[0,255]` (128≈unobserved) |
 | `~/elev_color` | `Image` bgr8 | luminance viz (debug) |
 | `~/extract_timing_ms` | `Float64MultiArray` | `[bev, snapshot, inpaint, slope, colorize, total]` ms |

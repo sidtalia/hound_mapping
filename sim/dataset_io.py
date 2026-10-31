@@ -1,8 +1,7 @@
-"""Dataset I/O for HOUND rail sim."""
+"""Dataset I/O for HOUND rail sim (single- and multi-view)."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,9 +26,15 @@ def save_frame(
     depth: np.ndarray,
     trav_rgb: np.ndarray,
     T_wo: np.ndarray,
+    *,
+    view: Optional[str] = None,
+    ir_left: Optional[np.ndarray] = None,
+    ir_right: Optional[np.ndarray] = None,
+    append_pose_bin: bool = True,
 ) -> None:
+    """Write one view. If ``view`` is set, filenames are ``NNNNNN_{view}_*``."""
     frames_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{index:06d}"
+    stem = f"{index:06d}" if view is None else f"{index:06d}_{view}"
     np.save(frames_dir / f"{stem}_depth.npy", depth.astype(np.float32))
     depth_mm = np.clip(depth * 1000.0, 0, 65535).astype(np.uint16)
     try:
@@ -37,12 +42,28 @@ def save_frame(
 
         cv2.imwrite(str(frames_dir / f"{stem}_depth_mm.png"), depth_mm)
         cv2.imwrite(str(frames_dir / f"{stem}_trav.png"), trav_rgb[:, :, ::-1])
+        if ir_left is not None:
+            cv2.imwrite(str(frames_dir / f"{stem}_ir_left.png"), ir_left)
+        if ir_right is not None:
+            cv2.imwrite(str(frames_dir / f"{stem}_ir_right.png"), ir_right)
     except ImportError:
         pass
     np.save(frames_dir / f"{stem}_T_wo.npy", T_wo.astype(np.float64))
-    # Row-major 4x4 for C++ smoke (append).
-    with open(frames_dir / "poses_T_wo.bin", "ab") as f:
-        f.write(np.ascontiguousarray(T_wo, dtype=np.float64).tobytes())
+    # Raw 4x4 float64 for C++ smoke (no npy parser).
+    (frames_dir / f"{stem}_T_wo.bin").write_bytes(
+        np.ascontiguousarray(T_wo, dtype=np.float64).tobytes()
+    )
+    if append_pose_bin:
+        # Legacy single-view: one pose per frame. Multi-view uses poses_body.bin.
+        with open(frames_dir / "poses_T_wo.bin", "ab") as f:
+            f.write(np.ascontiguousarray(T_wo, dtype=np.float64).tobytes())
+
+
+def append_body_pose(frames_dir: Path, T_wo_body: np.ndarray) -> None:
+    """Append body/front optical pose (4x4 float64) for multi-view clearing center."""
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    with open(frames_dir / "poses_body.bin", "ab") as f:
+        f.write(np.ascontiguousarray(T_wo_body, dtype=np.float64).tobytes())
 
 
 def write_camera_txt(out_dir: Path, cam: dict) -> None:
@@ -61,13 +82,14 @@ def write_camera_txt(out_dir: Path, cam: dict) -> None:
         f"voxel_size={float(cam.get('voxel_size', 0.05))}",
         f"elev_h={int(cam.get('elev_h', 0))}",
         f"elev_w={int(cam.get('elev_w', 0))}",
+        f"n_views={int(cam.get('n_views', 1))}",
+        f"views={cam.get('views', 'front')}",
     ]
     (out_dir / "camera.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
 
 
 def list_frame_indices(frames_dir: Path) -> List[int]:
     ids = []
     for p in sorted(frames_dir.glob("*_depth.npy")):
         ids.append(int(p.name.split("_")[0]))
-    return ids
+    return sorted(set(ids))

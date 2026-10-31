@@ -13,10 +13,10 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(tf2_eigen REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(tf2_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs photo)
 find_package(CUDAToolkit REQUIRED)
 find_package(glog REQUIRED)
@@ -31,6 +31,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 add_library(hound_mapping_core
   src/mapper_core.cpp
   src/elevation_cost.cpp
+  src/prior_bev_gpu.cpp
+  src/lethal_overlay_gpu.cpp
   cuda/tsdf_color_to_bev.cu
 )
 target_include_directories(hound_mapping_core PUBLIC
@@ -60,10 +62,10 @@ ament_target_dependencies(mapping_node
   sensor_msgs
   geometry_msgs
   nav_msgs
+  visualization_msgs
   std_msgs
-  tf2
-  tf2_ros
-  tf2_eigen
+  std_srvs
+  tf2_msgs
 )
 target_link_libraries(mapping_node
   hound_mapping_core
@@ -83,7 +85,29 @@ target_link_libraries(smoke_rail_mapper
 )
 target_compile_features(smoke_rail_mapper PUBLIC cxx_std_17)
 
-install(TARGETS hound_mapping_core mapping_node smoke_rail_mapper
+add_executable(layercake_to_mesh_node src/layercake_to_mesh_node.cpp)
+ament_target_dependencies(layercake_to_mesh_node
+  rclcpp
+  std_srvs
+)
+target_link_libraries(layercake_to_mesh_node
+  hound_mapping_core
+  nvblox::nvblox_lib
+)
+target_compile_features(layercake_to_mesh_node PUBLIC cxx_std_17)
+
+add_executable(layercake_to_bev src/layercake_to_bev.cpp)
+target_link_libraries(layercake_to_bev
+  hound_mapping_core
+  nvblox::nvblox_lib
+  ${OpenCV_LIBS}
+  glog::glog
+)
+target_compile_features(layercake_to_bev PUBLIC cxx_std_17)
+
+install(TARGETS
+  hound_mapping_core mapping_node smoke_rail_mapper layercake_to_mesh_node
+  layercake_to_bev
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -91,6 +115,10 @@ install(TARGETS hound_mapping_core mapping_node smoke_rail_mapper
 install(PROGRAMS
   scripts/generate_rail_dataset.py
   scripts/viser_rail_compare.py
+  scripts/author_lethal_map.py
+  scripts/author_lethal_rviz.py
+  scripts/show_mesh.py
+  scripts/smoke_multicam_rail.sh
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY sim
@@ -101,8 +129,8 @@ install(DIRECTORY include/
 )
 
 ament_export_dependencies(
-  rclcpp sensor_msgs geometry_msgs nav_msgs std_msgs
-  tf2 tf2_ros tf2_eigen nvblox
+  rclcpp sensor_msgs geometry_msgs nav_msgs visualization_msgs std_msgs
+  tf2_msgs nvblox
 )
 ament_export_include_directories(include)
 ament_package()

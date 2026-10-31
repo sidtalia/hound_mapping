@@ -43,6 +43,8 @@ struct CamCfg {
   float voxel_size = 0.05f;
   int elev_h = 0;
   int elev_w = 0;
+  int n_views = 1;
+  std::vector<std::string> views{"front"};
 };
 
 std::unordered_map<std::string, std::string> loadKv(const std::string& path)
@@ -85,6 +87,24 @@ CamCfg loadCamera(const std::string& dataset)
   c.voxel_size = getf("voxel_size", c.voxel_size);
   c.elev_h = geti("elev_h", 0);
   c.elev_w = geti("elev_w", 0);
+  c.n_views = geti("n_views", 1);
+  {
+    auto it = kv.find("views");
+    if (it != kv.end() && !it->second.empty()) {
+      c.views.clear();
+      std::stringstream ss(it->second);
+      std::string tok;
+      while (std::getline(ss, tok, ',')) {
+        if (!tok.empty()) {
+          c.views.push_back(tok);
+        }
+      }
+    }
+    if (c.views.empty()) {
+      c.views.push_back("front");
+    }
+    c.n_views = static_cast<int>(c.views.size());
+  }
   return c;
 }
 
@@ -160,18 +180,27 @@ int main(int argc, char** argv)
   const bool dump_frame_elev = node->get_parameter("dump_frame_elev").as_bool();
 
   auto poses = loadPoses(dataset + "/frames/poses_T_wo.bin", n);
-  if (static_cast<int>(poses.size()) < n) {
+  auto body_poses = loadPoses(dataset + "/frames/poses_body.bin", n);
+  const bool multicam = cam.n_views > 1 || !body_poses.empty();
+  if (!multicam && static_cast<int>(poses.size()) < n) {
     n = static_cast<int>(poses.size());
+  }
+  if (multicam && !body_poses.empty() &&
+      static_cast<int>(body_poses.size()) < n) {
+    n = static_cast<int>(body_poses.size());
   }
   RCLCPP_INFO(
       node->get_logger(),
-      "smoke_rail_mapper: %s  %d frames  cam %dx%d  window=%.1fm",
-      dataset.c_str(), n, cam.width, cam.height, cam.window_radius_m);
+      "smoke_rail_mapper: %s  %d frames  cam %dx%d  window=%.1fm  views=%d multicam=%d",
+      dataset.c_str(), n, cam.width, cam.height, cam.window_radius_m, cam.n_views,
+      multicam ? 1 : 0);
 
   hound_mapping::MapperConfig mc;
   mc.voxel_size_m = cam.voxel_size;
   mc.map_clearing_radius_m = cam.window_radius_m;
   mc.max_integration_distance_m = cam.max_depth_m + 1.f;
+  mc.color_max_integration_distance_m = mc.max_integration_distance_m;
+  mc.color_sphere_tracer_max_ray_length_m = mc.max_integration_distance_m;
   hound_mapping::MapperCore core(mc);
 
   hound_mapping::ElevationCostConfig ec;
@@ -244,44 +273,94 @@ int main(int argc, char** argv)
     }
     char stem[64];
     std::snprintf(stem, sizeof(stem), "%06d", i);
-    const std::string depth_path =
-        dataset + "/frames/" + stem + "_depth_mm.png";
-    const std::string trav_path = dataset + "/frames/" + stem + "_trav.png";
-    cv::Mat depth_mm = cv::imread(depth_path, cv::IMREAD_UNCHANGED);
-    cv::Mat trav_bgr = cv::imread(trav_path, cv::IMREAD_COLOR);
-    if (depth_mm.empty() || trav_bgr.empty()) {
+
+    const auto t0 = Clock::now();
+    nvblox::Transform T_clear = nvblox::Transform::Identity();
+    bool any = false;
+
+    auto integrate_one = [&](const std::string& depth_path,
+                             const std::string& trav_path,
+                             const nvblox::Transform& T_L_C) -> bool {
+      cv::Mat depth_mm = cv::imread(depth_path, cv::IMREAD_UNCHANGED);
+      cv::Mat trav_bgr = cv::imread(trav_path, cv::IMREAD_COLOR);
+      if (depth_mm.empty() || trav_bgr.empty()) {
+        return false;
+      }
+      if (depth_mm.type() != CV_16UC1) {
+        RCLCPP_ERROR(node->get_logger(), "depth not 16UC1: %s", depth_path.c_str());
+        return false;
+      }
+      nvblox::DepthImage depth(cam.height, cam.width, nvblox::MemoryType::kHost);
+      nvblox::ColorImage color(cam.height, cam.width, nvblox::MemoryType::kHost);
+      fillDepth(&depth, depth_mm);
+      fillColor(&color, trav_bgr);
+      core.integrateDepth(depth, T_L_C, camera);
+      core.integrateColor(color, T_L_C, camera);
+      return true;
+    };
+
+    if (multicam) {
+      for (const auto& view : cam.views) {
+        const std::string prefix =
+            dataset + "/frames/" + stem + "_" + view;
+        const std::string depth_path = prefix + "_depth_mm.png";
+        const std::string trav_path = prefix + "_trav.png";
+        const std::string pose_bin = prefix + "_T_wo.bin";
+        nvblox::Transform T_L_C = nvblox::Transform::Identity();
+        std::ifstream pbin(pose_bin, std::ios::binary);
+        if (!pbin) {
+          RCLCPP_WARN_THROTTLE(
+              node->get_logger(), *node->get_clock(), 2000,
+              "Missing %s — regenerate dataset", pose_bin.c_str());
+          continue;
+        }
+        double m[16];
+        pbin.read(reinterpret_cast<char*>(m), sizeof(m));
+        Eigen::Matrix4f M;
+        for (int r = 0; r < 4; ++r) {
+          for (int c = 0; c < 4; ++c) {
+            M(r, c) = static_cast<float>(m[r * 4 + c]);
+          }
+        }
+        T_L_C.matrix() = M;
+        if (integrate_one(depth_path, trav_path, T_L_C)) {
+          any = true;
+          if (view == "front") {
+            T_clear = T_L_C;
+          }
+        }
+      }
+      if (!body_poses.empty()) {
+        T_clear = body_poses[static_cast<size_t>(i)];
+      }
+    } else {
+      const std::string depth_path =
+          dataset + "/frames/" + stem + "_depth_mm.png";
+      const std::string trav_path = dataset + "/frames/" + stem + "_trav.png";
+      if (static_cast<int>(poses.size()) <= i) {
+        continue;
+      }
+      T_clear = poses[i];
+      any = integrate_one(depth_path, trav_path, T_clear);
+    }
+    if (!any) {
       RCLCPP_WARN(node->get_logger(), "Missing frame %s", stem);
       continue;
     }
-    if (depth_mm.type() != CV_16UC1) {
-      RCLCPP_ERROR(node->get_logger(), "depth not 16UC1");
-      return 1;
-    }
 
-    nvblox::DepthImage depth(
-        cam.height, cam.width, nvblox::MemoryType::kHost);
-    nvblox::ColorImage color(
-        cam.height, cam.width, nvblox::MemoryType::kHost);
-    fillDepth(&depth, depth_mm);
-    fillColor(&color, trav_bgr);
-
-    const nvblox::Transform& T_L_C = poses[i];
-    const auto t0 = Clock::now();
-    core.integrateDepth(depth, T_L_C, camera);
-    core.integrateColor(color, T_L_C, camera);
     const double t_int =
         std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
     const auto t1 = Clock::now();
     // Elev BEV reads TSDF directly (no ESDF layer).
-    core.clearOutsideRadius(T_L_C.translation());
+    core.clearOutsideRadius(T_clear.translation());
     const double t_clear =
         std::chrono::duration<double, std::milli>(Clock::now() - t1).count();
 
     hound_mapping::ExtractTiming timing;
     const auto t2 = Clock::now();
     const auto maps = extractor.extract(
-        core, T_L_C.translation(), T_L_C.translation().z(), &timing);
+        core, T_clear.translation(), T_clear.translation().z(), &timing);
     const double t_ext =
         std::chrono::duration<double, std::milli>(Clock::now() - t2).count();
     const double t_e2e =
